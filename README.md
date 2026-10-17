@@ -5,8 +5,11 @@ API and a CLI that expose everything the app can do: cloud login, the whole clou
 REST surface (396 endpoints), and printer control over MQTT (90 commands, live
 state, event stream) in cloud or LAN mode.
 
-Nothing here talks to Bambu's servers or to a printer until you give it credentials;
-the server holds none of its own.
+Nothing here talks to Bambu's servers or to a printer until you give it credentials.
+Run as a hosted service (`-db`), the server remembers each account's Bambu session
+at login and hands out API keys that act as that account, over REST and MCP. The
+hosted instance is at <https://bambuapi.raygen.dev> ([docs](https://bambuapi.raygen.dev/docs),
+[sign in](https://bambuapi.raygen.dev/login), MCP at `/mcp`).
 
 ## Layout
 
@@ -14,7 +17,8 @@ the server holds none of its own.
 |---|---|
 | `cmd/bambu-api` | the HTTP server |
 | `cmd/bambu` | the CLI (talks to the HTTP API, in-process by default) |
-| `internal/api` | routes, per-token sessions, OpenAPI document |
+| `internal/api` | routes, per-credential sessions, OpenAPI document, Scalar docs + login page, MCP server |
+| `internal/store` | SQLite persistence: accounts (Bambu session per uid) and API keys |
 | `pkg/bambu/cloud` | REST client: auth, regions, generated models + endpoint catalog, IoT app-cert signing |
 | `pkg/bambu/mqtt` | MQTT client (cloud + LAN), generated command catalog, G-code builders, secure channel signing, device state merge |
 | `pkg/bambu/secure` | RSA / canonical-JSON helpers shared by both |
@@ -58,30 +62,108 @@ loopback port; `bambu config server https://host` (or `BAMBU_SERVER` /
 
 ```sh
 go build ./cmd/bambu-api
-./bambu-api -addr :8080                      # intl region
+./bambu-api -addr :8080                      # intl region, no persistence: bring your own Bambu token
 ./bambu-api -region china                    # api.lunkuocorp.cn / cn.mqtt
-./bambu-api -api-key s3cret                  # require X-API-Key on every request
+./bambu-api -db /data/bambu-api.sqlite -data-key $(openssl rand -hex 32) \
+            -public-url https://bambuapi.example.com -cors-origins https://app.example.com
 ```
 
-Flags also read `BAMBU_API_ADDR`, `BAMBU_REGION`, `BAMBU_API_KEY`, `BAMBU_HARDWARE_ID`,
-`BAMBU_APP_CERT`, `BAMBU_APP_KEY`, `BAMBU_LAN_CA`. `GET /openapi.json` describes
-every route, including one operation per MQTT command and per cloud endpoint.
+`-db` turns on the hosted mode below (accounts, API keys, `/login`, `/mcp`);
+`-data-key` (32 bytes, hex) encrypts the stored Bambu tokens at rest. Flags also
+read `BAMBU_API_ADDR`, `BAMBU_REGION`, `BAMBU_DB`, `BAMBU_DATA_KEY`, `BAMBU_PUBLIC_URL`,
+`BAMBU_CORS_ORIGINS`, `BAMBU_API_KEY` (a static gate on top of per-user auth),
+`BAMBU_HARDWARE_ID`, `BAMBU_APP_CERT`, `BAMBU_APP_KEY`, `BAMBU_LAN_CA`; `BAMBU_ENV_FILE`
+names a dotenv file loaded first, for secrets a scheduler should not see.
+`GET /openapi.json` describes every route, including one operation per MQTT command
+and per cloud endpoint, and `GET /docs` renders it with Scalar. The `Dockerfile`
+builds a static binary on a distroless image that expects `/data` as a volume.
 
 ## Auth model
 
-The server is multi-tenant by Bambu token. `POST /v1/auth/login` returns the app's
-login response (`accessToken`, or a `tfaKey` / `loginType` for the second step);
-pass that token as `Authorization: Bearer <accessToken>` to everything else. The
-password is RSA-OAEP-SHA256-encrypted with Bambu's published key exactly like the
-app does. Sessions (profile, MQTT connection) are created lazily per token and
-dropped after `-mqtt-idle`.
+Every route takes `Authorization: Bearer <credential>` (or `X-API-Key`). The
+credential is one of two things:
+
+- **A Bambu access token**, straight from the login endpoints below. The server
+  is multi-tenant by token; sessions (cloud client, MQTT connection) are created
+  lazily per token and dropped after `-mqtt-idle`.
+- **An API key** (`bk_` + 32 url-safe characters), which acts as the Bambu account
+  that created it. The key is a handle on the server-side session stored at that
+  account's latest login, so it never expires on its own and follows re-logins.
+
+### Login
+
+`POST /v1/auth/login` returns the app's login response verbatim: `accessToken`
+(plus `refreshToken`, `expiresIn`) when done, or `loginType` for a second step.
+The password is RSA-OAEP-SHA256-encrypted with Bambu's published key exactly like
+the app does. The state machine the Handy app, the CLI and `/login` all follow:
+
+1. `POST /v1/auth/login {"account": email, "password": pw}`
+2. If `loginType == "verifyCode"` (new device/location): `POST /v1/auth/email-code
+   {"email": email, "type": "codeLogin"}`, then repeat step 1 as
+   `{"account": email, "code": "<emailed code>"}`.
+3. If `loginType == "tfa"`: `POST /v1/auth/tfa {"tfaKey": <from step 1>, "tfaCode": "<TOTP>"}`.
+4. Anything with `accessToken` set is a success. Errors come back with the cloud's
+   status and `{"error", "code", "detail"}`.
+
+With `-db`, every successful login/TFA on this server also **stores the session**
+(uid, account email, token, refresh token, expiry) under the Bambu uid, creating
+the account on first login with a stable random hardware id that its MQTT client
+id and `X-BBL-Device-ID` use from then on. Logging in again replaces the token;
+all of the account's keys switch to it immediately.
 
 ```sh
-curl -X POST localhost:8080/v1/auth/login -d '{"account":"me@example.com","password":"..."}'
-curl -X POST localhost:8080/v1/auth/tfa   -d '{"tfaKey":"...","tfaCode":"123456"}'
-curl -X POST localhost:8080/v1/auth/email-code -d '{"email":"me@example.com","type":"codeLogin"}'
-curl -H 'Authorization: Bearer TOKEN' localhost:8080/v1/me
-curl -H 'Authorization: Bearer TOKEN' localhost:8080/v1/devices
+curl -X POST $API/v1/auth/login -d '{"account":"me@example.com","password":"..."}'
+curl -X POST $API/v1/auth/email-code -d '{"email":"me@example.com","type":"codeLogin"}'
+curl -X POST $API/v1/auth/login -d '{"account":"me@example.com","code":"123456"}'
+curl -X POST $API/v1/auth/tfa   -d '{"tfaKey":"...","tfaCode":"123456"}'
+curl -H 'Authorization: Bearer TOKEN' $API/v1/me
+```
+
+### API keys
+
+Key management needs the **Bambu token** of an account that has logged in here
+(a key cannot mint keys or sign the account out):
+
+| Route | Does |
+|---|---|
+| `GET /v1/account` | the stored account behind the credential: `uid`, `email`, `hardwareId`, `signedIn`, `tokenExpiresAt`, `lastLoginAt`, `keys` (count), `viaKey` when called with a key |
+| `GET /v1/keys` | `{"keys": [{id, name, prefix, createdAt, lastUsedAt}]}` |
+| `POST /v1/keys {"name"}` | `201` with the same fields plus `key` — the secret, returned once |
+| `DELETE /v1/keys/{id}` | `204`; the key stops working immediately |
+| `POST /v1/auth/logout` | invalidates the token at the cloud **and clears the stored session**: every key of the account answers `401 … signed out` until the next login |
+
+Statuses: `401` unknown/revoked key or signed-out account, `403` a key tried to
+manage keys or log out, `501` the server runs without `-db`. The browser flow at
+`/login` does all of this (sign in with code/2FA, create, list, revoke, sign out);
+a web app does the same calls cross-origin when its origin is in `-cors-origins`.
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" -X POST $API/v1/keys -d '{"name":"laptop"}'
+# {"id":"…","name":"laptop","prefix":"bk_AbCdEfGh","createdAt":"…","key":"bk_AbCdEfGh…"}
+curl -H "Authorization: Bearer bk_AbCdEfGh…" $API/v1/devices
+bambu config server https://bambuapi.raygen.dev && bambu config apiKey bk_AbCdEfGh…
+```
+
+## MCP
+
+`/mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server over
+streamable HTTP (stateless; one POST per call). It authenticates with an API key
+as the bearer token and every tool acts as that key's account:
+
+| Tool | Does |
+|---|---|
+| `whoami` | account profile |
+| `list_printers` | bound printers (serial, name, model, online, status) |
+| `printer_status {serial, refresh?}` | merged live `print.*` state |
+| `list_commands {module?}` | the command catalog with parameters |
+| `send_command {serial, name, params}` | any catalogued command, waits for the ack (destructive) |
+| `send_gcode {serial, gcode}` | raw G-code (destructive) |
+| `print_history {limit?}` | `user-service/my/tasks` |
+| `cloud_request {method, path, query?, body?}` | any cloud endpoint, signed when the catalog says so |
+
+```json
+{ "mcpServers": { "bambu": { "type": "http", "url": "https://bambuapi.raygen.dev/mcp",
+                             "headers": { "Authorization": "Bearer bk_…" } } } }
 ```
 
 ## Printer control
@@ -186,6 +268,14 @@ on any other endpoint.
   surface as decode errors on endpoints that have not been exercised. Cloud request shapes come from the decompiled app and its
   decrypted string table, not from live traffic.
 - Camera/live-view (WebRTC/TUTK streams in the app) is not exposed.
+
+## Deploying
+
+The homelab instance runs on Nomad from `pulumi-homelab/nomad/bambu-api`: a
+`docker build` of this repository, `docker save | docker load` onto the Nomad
+client, a hardened allocation (read-only root, no capabilities, uid 1000) with
+`/data` on a host volume and the data key in a read-only env file, and Traefik
+routing on `bambuapi.raygen.dev` via Consul tags.
 
 ## Regenerating
 
