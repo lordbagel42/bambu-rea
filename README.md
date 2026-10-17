@@ -1,0 +1,195 @@
+# bambu-rea
+
+Bambu Handy 4.2.2 (Android) reverse-engineered into a Go library, an HTTP/JSON
+API and a CLI that expose everything the app can do: cloud login, the whole cloud
+REST surface (396 endpoints), and printer control over MQTT (90 commands, live
+state, event stream) in cloud or LAN mode.
+
+Nothing here talks to Bambu's servers or to a printer until you give it credentials;
+the server holds none of its own.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `cmd/bambu-api` | the HTTP server |
+| `cmd/bambu` | the CLI (talks to the HTTP API, in-process by default) |
+| `internal/api` | routes, per-token sessions, OpenAPI document |
+| `pkg/bambu/cloud` | REST client: auth, regions, generated models + endpoint catalog, IoT app-cert signing |
+| `pkg/bambu/mqtt` | MQTT client (cloud + LAN), generated command catalog, G-code builders, secure channel signing, device state merge |
+| `pkg/bambu/secure` | RSA / canonical-JSON helpers shared by both |
+| `catalog/*.json` | endpoints, models and MQTT commands extracted from the decompiled app |
+| `tools/` | extraction scripts and `gen_go.py`, which regenerates the `*_gen.go` files from `catalog/` |
+| `.amp/in/artifacts/` (git-excluded) | REA outputs: split APKs, jadx trees, decrypted strings, `REPORT.md` |
+
+## CLI
+
+```sh
+go build ./cmd/bambu
+bambu login                     # password (no echo) → emailed code → 2FA, like the app
+bambu printers                  # cloud-bound printers; `bambu use <serial>` picks the default
+bambu status                    # state, progress/ETA/layers, temps, fans, speed, lights, AMS, HMS
+bambu watch                     # live tail of the printer's reports
+bambu pause | resume | stop
+bambu speed sport               # silent|standard|sport|ludicrous
+bambu light off                 # chamber light
+bambu fan part 50               # part|aux|chamber, percent
+bambu temp bed 60               # M140/M104 (what the app sends on older firmware); -native for set_*_temp
+bambu gcode "G28"               # or `bambu gcode -` to read stdin
+bambu move -x 10 -f 3000        # relative jog; bambu home x y
+bambu ams status | load 0 2 | unload
+bambu print /sdcard/model.gcode.3mf     # print a file already on the printer (gcode_file)
+bambu cmd GetVersion            # any catalogued command, key=value params; `bambu cmd --list`
+bambu raw system get_access_code
+bambu tasks -n 20               # print history
+bambu cloud GET user-service/my/profile          # any catalogued endpoint; -d json|@file, -q k=v
+bambu lan add 192.168.1.50 01P00A... 12345678    # LAN mode, no cloud account needed
+bambu security exchange         # MQTT secure channel; bambu appcert shows the app certificate
+```
+
+`--json` on any command prints the API's JSON; `-p <serial>` overrides the default
+printer. State is kept in `~/.config/bambu/config.json` (0600; `BAMBU_CONFIG`
+overrides). Without `--server` the CLI runs `internal/api` in-process on a
+loopback port; `bambu config server https://host` (or `BAMBU_SERVER` /
+`BAMBU_API_KEY`) points it at a deployed `bambu-api` instead. `BAMBU_EMAIL` /
+`BAMBU_PASSWORD` let `bambu login` run non-interactively.
+
+## Run the server
+
+```sh
+go build ./cmd/bambu-api
+./bambu-api -addr :8080                      # intl region
+./bambu-api -region china                    # api.lunkuocorp.cn / cn.mqtt
+./bambu-api -api-key s3cret                  # require X-API-Key on every request
+```
+
+Flags also read `BAMBU_API_ADDR`, `BAMBU_REGION`, `BAMBU_API_KEY`, `BAMBU_HARDWARE_ID`,
+`BAMBU_APP_CERT`, `BAMBU_APP_KEY`, `BAMBU_LAN_CA`. `GET /openapi.json` describes
+every route, including one operation per MQTT command and per cloud endpoint.
+
+## Auth model
+
+The server is multi-tenant by Bambu token. `POST /v1/auth/login` returns the app's
+login response (`accessToken`, or a `tfaKey` / `loginType` for the second step);
+pass that token as `Authorization: Bearer <accessToken>` to everything else. The
+password is RSA-OAEP-SHA256-encrypted with Bambu's published key exactly like the
+app does. Sessions (profile, MQTT connection) are created lazily per token and
+dropped after `-mqtt-idle`.
+
+```sh
+curl -X POST localhost:8080/v1/auth/login -d '{"account":"me@example.com","password":"..."}'
+curl -X POST localhost:8080/v1/auth/tfa   -d '{"tfaKey":"...","tfaCode":"123456"}'
+curl -X POST localhost:8080/v1/auth/email-code -d '{"email":"me@example.com","type":"codeLogin"}'
+curl -H 'Authorization: Bearer TOKEN' localhost:8080/v1/me
+curl -H 'Authorization: Bearer TOKEN' localhost:8080/v1/devices
+```
+
+## Printer control
+
+Commands are named as in the app's catalog (`GET /v1/catalog/commands`): e.g.
+`Pause`, `Resume`, `Stop`, `SetFan`, `SetNozzleTemp`, `SetBedTemp`, `PrintSpeed`,
+`LedCtrl`, `AmsFilamentSetting`, `AmsChangeFilament`, `ProjectFile` (start a print),
+`PushAll`, `GetAccessCode`, `GetVersion`, `UpgradeStart`, `Calibration`, ...
+
+```sh
+B='-H Authorization:Bearer\ TOKEN'
+curl $B localhost:8080/v1/devices/SN/state                     # merged status (print.*), replies[module][command]
+curl $B localhost:8080/v1/devices/SN/events                    # SSE stream of every report
+curl $B -X POST localhost:8080/v1/devices/SN/commands/SetFan -d '{"fan_index":2,"speed":128}'
+curl $B -X POST localhost:8080/v1/devices/SN/commands/Pause?wait=0 -d '{}'   # 202, don't wait for the ack
+curl $B -X POST localhost:8080/v1/devices/SN/gcode -d '{"gcode":"M140 S60"}'
+curl $B -X POST localhost:8080/v1/devices/SN/move  -d '{"z":-1}'                # x/y/z mm, optional feed_rate
+curl $B -X POST localhost:8080/v1/devices/SN/home  -d '{}'
+curl $B -X POST localhost:8080/v1/devices/SN/raw   -d '{"module":"print","command":"gcode_line","params":{"param":"G28\n"}}'
+```
+
+Parameter values are encoded the way the app encodes them (`enable_disable`,
+`int01`, upper-cased enums, G-code builders with the app's `M211`/`M1002` wrapper
+and feed rates); missing required parameters are rejected with 400 before anything
+is published. Replies are matched by `sequence_id` with the app's 10 s timeout; a
+printer `result != success` yields 422 with the full reply.
+
+### LAN mode
+
+LAN printers are registered per session with their access code and are reachable
+under the same `/v1/devices/{sn}/...` routes:
+
+```sh
+curl $B -X POST localhost:8080/v1/lan/devices -d '{"ip":"192.168.1.50","serial":"01P00A...","accessCode":"12345678"}'
+```
+
+TLS is verified against the app's bundled `bbl_local_ca.pem` and the certificate's
+CN must equal the serial; `"insecure":true` skips verification for printers with
+replaced certificates. `-lan-ca` adds extra trusted roots.
+
+### Secure channel
+
+`pkg/bambu/mqtt.SecureChannel` implements the app's v1.0 signed envelope (RSA-SHA256
+over the canonical sorted JSON, `header` appended last) and per-field RSA encryption
+(`param_enc`, `url_enc`, `ttcode_enc`) with the printer certificate obtained from
+`security/app_cert_install`.
+
+The app only signs for printers whose capabilities report `security=true`; that
+bit comes from a native layer this repository could not read, so the server uses
+two triggers instead: `POST /v1/devices/{sn}/security/exchange` runs the exchange
+explicitly, and any reply carrying errno `84033543/44/45/47/48` (the app's own
+"verification failed" set) runs it automatically and retries the command signed.
+`GET /v1/devices/{sn}/security` shows the state; `DELETE` forgets it.
+
+## Cloud passthrough
+
+Every catalogued endpoint can be called under `/v1/cloud/<path>` with the same
+method, query and body as the app, and the standard app headers (`User-Agent:
+Handy/4.2.2`, `X-BBL-Client-*`, ...) are added for you:
+
+```sh
+curl $B 'localhost:8080/v1/cloud/iot-service/api/user/bind'
+curl $B 'localhost:8080/v1/cloud/user-service/my/tasks?limit=20'
+curl $B 'localhost:8080/v1/cloud/mall-app-bff/...'        # routed to ap-store-api.bambulab.com
+```
+
+Endpoints the app signs with its IoT app certificate are signed automatically
+(`x-bbl-app-certification-id`, `x-bbl-device-security-sign`, `X-BBL-Client-ID`)
+using the fetched or supplied app certificate; `X-Bambu-Signed: 1` forces signing
+on any other endpoint.
+
+## Known limitations
+
+- **IoT app certificate.** Five endpoints (`DELETE iot-service/api/user/bind`,
+  `POST iot-service/api/user/ttcode`, `POST user-service/my/pincode/{pincode}`,
+  `POST user-service/my/task`, `POST user-service/my/ticket/{ticket}`) and the MQTT
+  secure channel use a per-app certificate fetched from
+  `iot-service/api/user/applications/{appKey}/cert`. `cloud.FetchAppCert`
+  reproduces the app's request (AES-256-GCM `{appKey}` path segment under a
+  session key that is RSA-PKCS1v15-wrapped to the pinned `service.bambulab.com`
+  certificate) and has been verified against the live service: the response
+  `key` decrypts under the session key to a PEM private key whose modulus matches
+  the leaf (`CN=GLOF3813734089-af70cf3b0000`, issuer `GLOF3813734089.bambulab.com`,
+  valid to 2028-01-25). The fetch needs no user token and the certificate is
+  shared, so the server fetches one on first use (cache 600 s like the app) or
+  takes `-app-cert`/`-app-key`/`-app-crl`. The signed endpoints themselves have
+  not been called against the cloud from this repository; `GET /v1/appcert`
+  shows what would be used.
+- `X-BBL-Client-ID` is sent on signed requests as `android:<uid>:<hardware-id>`,
+  which is what `LiveviewRepository.buildTtCodeHeaders` builds; the app's
+  per-call `clientIdKey:` prefix variant is not exposed.
+- Live-verified against a real account (A1 mini + P1P over cloud MQTT): login,
+  bind list, print history, state/`watch`, `ledctrl`, `get_version`, and the
+  signed `iot-service/api/user/ttcode` endpoint (the cloud accepted the
+  certificate headers and returned TUTK credentials). The secure-channel
+  exchange, signed envelopes and `param_enc` were validated only against a local
+  broker with a fake printer that verifies the signatures; no real printer has
+  had `security/app_cert_install` sent to it from here.
+- Cloud responses do not always match the app's declared types (Gson coerces,
+  e.g. `nozzle_diameter` arrives as a number for a `String` field); the client
+  re-shapes such scalars instead of failing, but other mismatches may still
+  surface as decode errors on endpoints that have not been exercised. Cloud request shapes come from the decompiled app and its
+  decrypted string table, not from live traffic.
+- Camera/live-view (WebRTC/TUTK streams in the app) is not exposed.
+
+## Regenerating
+
+```sh
+python3 tools/gen_go.py   # rewrites pkg/bambu/cloud/{models_gen,endpoints_gen}.go and pkg/bambu/mqtt/commands_gen.go
+go build ./... && go vet ./... && go test ./...
+```
