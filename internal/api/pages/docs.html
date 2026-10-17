@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <title>bambu-api reference</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { margin: 0; }
+      .bambu-banner { font: 14px/1.5 system-ui, sans-serif; padding: 10px 16px; background: #1f2937; color: #f9fafb; }
+      .bambu-banner a { color: #93c5fd; }
+    </style>
+  </head>
+  <body>
+    <div class="bambu-banner">
+      Sign in with your Bambu account and create an API key at <a href="/login">/login</a>, then paste it as the Bearer token below.
+      MCP clients connect to <code>/mcp</code> with the same key.
+    </div>
+    <div id="app"></div>
+    <script type="module">
+      import { createApiReference } from 'https://cdn.jsdelivr.net/npm/@scalar/api-reference/esm.js'
+      createApiReference('#app', {
+        url: '/openapi.json',
+        persistAuth: true,
+        hideClientButton: true,
+        authentication: { preferredSecurityScheme: 'bearer' },
+      })
+    </script>
+  </body>
+</html>

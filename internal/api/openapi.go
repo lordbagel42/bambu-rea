@@ -16,7 +16,7 @@ var (
 )
 
 func (s *Server) handleOpenAPI(w http.ResponseWriter, _ *http.Request) {
-	openAPIOnce.Do(func() { openAPIDoc = buildOpenAPI(s.cfg.Region) })
+	openAPIOnce.Do(func() { openAPIDoc = buildOpenAPI(s.cfg.Region, s.cfg.PublicURL, s.store != nil) })
 	writeJSON(w, 200, openAPIDoc)
 }
 
@@ -64,9 +64,10 @@ func javaSchema(jt string) map[string]any {
 
 // buildOpenAPI renders an OpenAPI 3.0 description of the server, including one
 // operation per cloud endpoint and per printer command, from the catalogs.
-func buildOpenAPI(region cloud.Region) map[string]any {
+func buildOpenAPI(region cloud.Region, publicURL string, hosted bool) map[string]any {
 	paths := map[string]any{}
-	bearerSec := []any{obj("bearer", []any{})}
+	bearerSec := []any{obj("bearer", []any{}), obj("apiKeyHeader", []any{})}
+	loginSec := []any{obj("bearer", []any{})}
 	jsonResp := func(desc string) map[string]any {
 		return obj("200", obj("description", desc, "content", obj("application/json", obj("schema", obj("type", "object")))))
 	}
@@ -93,8 +94,32 @@ func buildOpenAPI(region cloud.Region) map[string]any {
 	paths["/v1/auth/email-code"] = obj("post", obj("tags", []any{"auth"}, "summary", "Send a login verification code to an email address",
 		"requestBody", jsonBody(obj("type", "object", "required", []any{"email"}, "properties", obj("email", obj("type", "string"), "type", obj("type", "string", "default", "codeLogin")))),
 		"responses", jsonResp("ok")))
-	paths["/v1/auth/logout"] = obj("post", obj("tags", []any{"auth"}, "security", bearerSec, "summary", "Invalidate the token", "responses", jsonResp("ok")))
+	paths["/v1/auth/logout"] = obj("post", obj("tags", []any{"auth"}, "security", loginSec, "summary", "Invalidate the Bambu token and sign the stored account out",
+		"description", "Also forgets the session stored for the account, so its API keys stop working until the next login. API keys may not call this.", "responses", jsonResp("ok")))
 	paths["/v1/me"] = obj("get", obj("tags", []any{"auth"}, "security", bearerSec, "summary", "Current user profile", "responses", jsonResp("User")))
+
+	if hosted {
+		keySchema := obj("type", "object", "properties", obj("id", obj("type", "string"), "name", obj("type", "string"), "prefix", obj("type", "string", "description", "first characters of the key, for display"),
+			"createdAt", obj("type", "string", "format", "date-time"), "lastUsedAt", obj("type", "string", "format", "date-time")))
+		paths["/v1/account"] = obj("get", obj("tags", []any{"account"}, "security", bearerSec, "summary", "The stored account behind the credential",
+			"description", "Accounts are created by a successful /v1/auth/login or /v1/auth/tfa on this server. With an API key, viaKey names the key used.",
+			"responses", obj("200", obj("description", "account", "content", obj("application/json", obj("schema", obj("type", "object", "properties", obj(
+				"uid", obj("type", "string"), "email", obj("type", "string"), "hardwareId", obj("type", "string"), "signedIn", obj("type", "boolean"),
+				"tokenExpiresAt", obj("type", "string", "format", "date-time"), "lastLoginAt", obj("type", "string", "format", "date-time"), "keys", obj("type", "integer"), "viaKey", keySchema))))))))
+		paths["/v1/keys"] = obj(
+			"get", obj("tags", []any{"account"}, "security", loginSec, "summary", "List the account's API keys (Bambu token required, not a key)",
+				"responses", obj("200", obj("description", "keys", "content", obj("application/json", obj("schema", obj("type", "object", "properties", obj("keys", obj("type", "array", "items", keySchema)))))))),
+			"post", obj("tags", []any{"account"}, "security", loginSec, "summary", "Create an API key that acts as this account (Bambu token required, not a key)",
+				"description", "The secret is returned once. Send it as Authorization: Bearer or X-API-Key on every route, including /mcp. Keys follow the account's latest login and stop working after /v1/auth/logout.",
+				"requestBody", obj("content", obj("application/json", obj("schema", obj("type", "object", "properties", obj("name", obj("type", "string", "maxLength", 100)))))),
+				"responses", obj("201", obj("description", "created", "content", obj("application/json", obj("schema", obj("allOf", []any{keySchema, obj("type", "object", "required", []any{"key"}, "properties", obj("key", obj("type", "string", "description", "the secret, shown once")))})))))))
+		paths["/v1/keys/{id}"] = obj("delete", obj("tags", []any{"account"}, "security", loginSec, "summary", "Revoke an API key",
+			"parameters", []any{obj("name", "id", "in", "path", "required", true, "schema", obj("type", "string"))}, "responses", obj("204", obj("description", "revoked"))))
+		paths["/mcp"] = obj("post", obj("tags", []any{"mcp"}, "security", []any{obj("apiKey", []any{})}, "summary", "Model Context Protocol endpoint (streamable HTTP)",
+			"description", "Connect an MCP client here with an API key as the bearer token. Tools: whoami, list_printers, printer_status, list_commands, send_command, send_gcode, print_history, cloud_request.",
+			"requestBody", obj("content", obj("application/json", obj("schema", obj("type", "object", "description", "JSON-RPC 2.0 message")))),
+			"responses", obj("200", obj("description", "JSON-RPC response (application/json or text/event-stream)"))))
+	}
 
 	paths["/v1/devices"] = obj("get", obj("tags", []any{"printer"}, "security", bearerSec, "summary", "Printers bound to the account", "responses", jsonResp("DeviceModel")))
 	paths["/v1/devices/{sn}/state"] = obj("get", obj("tags", []any{"printer"}, "security", bearerSec, "summary", "Merged live state from the printer's report stream",
@@ -212,7 +237,7 @@ func buildOpenAPI(region cloud.Region) map[string]any {
 		entry[strings.ToLower(ep.Method)] = op
 	}
 
-	tags := []any{"meta", "auth", "printer", "lan", "commands", "cloud"}
+	tags := []any{"meta", "auth", "account", "mcp", "printer", "security", "lan", "commands", "cloud"}
 	mods := mqtt.Modules()
 	sort.Strings(mods)
 	for _, m := range mods {
@@ -222,13 +247,23 @@ func buildOpenAPI(region cloud.Region) map[string]any {
 	for _, t := range tags {
 		tagObjs = append(tagObjs, obj("name", t))
 	}
+	desc := "Everything Bambu Handy " + cloud.AppVersionName + " can do, as HTTP. Printers are controlled over MQTT (cloud broker " + region.MQTTHost + " or LAN).\n\n" +
+		"**Authentication.** Every route takes `Authorization: Bearer <credential>`, where the credential is either the Bambu access token returned by `/v1/auth/login` (or `/v1/auth/tfa`) " +
+		"or an API key (`bk_…`) minted at [/login](/login) or `POST /v1/keys`. An API key acts as the Bambu account that created it, using the session stored at that account's latest login here. " +
+		"Key management and logout need the Bambu token.\n\n**MCP.** `/mcp` speaks the Model Context Protocol over streamable HTTP with the same API keys."
+	servers := []any{obj("url", "/")}
+	if publicURL != "" {
+		servers = []any{obj("url", publicURL)}
+	}
 	return obj(
 		"openapi", "3.0.3",
-		"info", obj("title", "bambu-api", "version", cloud.AppVersionName,
-			"description", "Everything Bambu Handy "+cloud.AppVersionName+" can do, as HTTP. Cloud calls use the caller's Bambu access token as Bearer auth; printers are controlled over MQTT (cloud broker "+region.MQTTHost+" or LAN)."),
-		"servers", []any{obj("url", "/")},
+		"info", obj("title", "bambu-api", "version", cloud.AppVersionName, "description", desc),
+		"servers", servers,
 		"tags", tagObjs,
-		"components", obj("securitySchemes", obj("bearer", obj("type", "http", "scheme", "bearer", "description", "Bambu cloud access token from /v1/auth/login"))),
+		"components", obj("securitySchemes", obj(
+			"bearer", obj("type", "http", "scheme", "bearer", "description", "Bambu cloud access token from /v1/auth/login, or an API key (bk_…)"),
+			"apiKeyHeader", obj("type", "apiKey", "in", "header", "name", "X-API-Key", "description", "API key (bk_…) as an alternative to the Authorization header"),
+			"apiKey", obj("type", "http", "scheme", "bearer", "description", "API key (bk_…) from /login"))),
 		"paths", paths,
 	)
 }

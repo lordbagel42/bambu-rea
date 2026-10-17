@@ -1,6 +1,7 @@
 // Package api is the HTTP front end of bambu-api. Cloud calls are made with the
-// caller's Bambu access token (Authorization: Bearer ...), so the server holds no
-// credentials of its own; LAN printers are registered with their access code.
+// caller's Bambu access token (Authorization: Bearer ...) or with an API key
+// that maps to a Bambu session stored at login; LAN printers are registered
+// with their access code.
 package api
 
 import (
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lordbagel42/bambu-rea/internal/store"
 	"github.com/lordbagel42/bambu-rea/pkg/bambu/cloud"
 	"github.com/lordbagel42/bambu-rea/pkg/bambu/mqtt"
 )
@@ -24,21 +26,31 @@ import (
 // Config configures a Server.
 type Config struct {
 	Region     cloud.Region
-	APIKey     string // optional shared secret required in X-API-Key
+	APIKey     string // optional shared secret required in X-API-Key on top of per-user auth
 	HardwareID string
 	AppCert    *cloud.AppCert // optional captured app certificate for IoT-signed endpoints
 	IdleAfter  time.Duration
 	// LANExtraRoots are additional PEM CA bundles trusted for LAN printers.
 	LANExtraRoots [][]byte
 	Logger        *log.Logger
+	// Store persists accounts and API keys. Without it logins are not
+	// remembered and the key, account and MCP routes are unavailable.
+	Store *store.Store
+	// PublicURL is the externally visible base URL (for the OpenAPI servers
+	// list and MCP metadata); empty means "same origin".
+	PublicURL string
+	// CORSOrigins are browser origins allowed to call the API; "*" allows any.
+	CORSOrigins []string
 }
 
 // Server is the HTTP handler.
 type Server struct {
-	cfg  Config
-	mux  *http.ServeMux
-	anon *cloud.Client
-	log  *log.Logger
+	cfg        Config
+	mux        *http.ServeMux
+	anon       *cloud.Client
+	httpClient *http.Client
+	store      *store.Store
+	log        *log.Logger
 
 	// appCert is the shared, cloud-issued app certificate used for IoT-signed
 	// HTTP endpoints and the MQTT secure channel. The cert endpoint needs no
@@ -62,20 +74,24 @@ func New(cfg Config) *Server {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
+	hc := &http.Client{Timeout: 60 * time.Second}
 	s := &Server{
-		cfg:      cfg,
-		mux:      http.NewServeMux(),
-		anon:     cloud.New(cfg.Region, cloud.WithDeviceInfo(cloud.DeviceInfo{DeviceID: cfg.HardwareID, Brand: "google", Model: "Pixel 8", OSVersion: "15", Language: "en"})),
-		log:      cfg.Logger,
-		sessions: map[string]*session{},
-		lan:      map[string]*lanPrinter{},
-		done:     make(chan struct{}),
+		cfg:        cfg,
+		mux:        http.NewServeMux(),
+		anon:       cloud.New(cfg.Region, cloud.WithHTTPClient(hc), cloud.WithDeviceInfo(deviceInfo(cfg.HardwareID))),
+		httpClient: hc,
+		store:      cfg.Store,
+		log:        cfg.Logger,
+		sessions:   map[string]*session{},
+		lan:        map[string]*lanPrinter{},
+		done:       make(chan struct{}),
 	}
 	if cfg.AppCert != nil {
 		s.appCert = cloud.NewAppCertSigner(nil, cfg.AppCert)
 	} else {
 		s.appCert = cloud.NewAppCertSigner(s.anon, nil)
 	}
+	s.anon.Signer = s.appCert
 	s.routes()
 	go s.reap()
 	return s
@@ -87,11 +103,7 @@ func (s *Server) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, sess := range s.sessions {
-		sess.mu.Lock()
-		if sess.mqtt != nil {
-			sess.mqtt.Close()
-		}
-		sess.mu.Unlock()
+		sess.closeMQTT()
 	}
 	for _, p := range s.lan {
 		p.mu.Lock()
@@ -106,6 +118,9 @@ func (s *Server) Close() {
 func (s *Server) CommandCount() int { return len(mqtt.Specs) }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.cors(w, r) {
+		return
+	}
 	if s.cfg.APIKey != "" && r.Header.Get("X-API-Key") != s.cfg.APIKey && r.URL.Path != "/v1/healthz" {
 		writeErr(w, http.StatusUnauthorized, "missing or invalid X-API-Key")
 		return
@@ -113,10 +128,44 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
+// cors answers browser preflights and stamps allowed origins on every response.
+// It returns true when the request was a preflight and has been answered.
+func (s *Server) cors(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" || len(s.cfg.CORSOrigins) == 0 {
+		return false
+	}
+	allowed := false
+	for _, o := range s.cfg.CORSOrigins {
+		if o == "*" || strings.EqualFold(o, origin) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return false
+	}
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", origin)
+	h.Add("Vary", "Origin")
+	h.Set("Access-Control-Expose-Headers", "Content-Type, Mcp-Session-Id")
+	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key, X-Bambu-Token, X-Bambu-Signed, X-BBL-Client-Type, X-BBL-Client-Version, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID")
+		h.Set("Access-Control-Max-Age", "600")
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+	return false
+}
+
 func (s *Server) routes() {
 	m := s.mux
 	m.HandleFunc("GET /v1/healthz", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, map[string]any{"ok": true}) })
 	m.HandleFunc("GET /openapi.json", s.handleOpenAPI)
+	m.HandleFunc("GET /docs", s.handleDocs)
+	m.HandleFunc("GET /login", s.handleLoginPage)
+	m.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/docs", http.StatusFound) })
 	m.HandleFunc("GET /v1/catalog/endpoints", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, cloud.Endpoints) })
 	m.HandleFunc("GET /v1/catalog/commands", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, mqtt.Specs) })
 	m.HandleFunc("GET /v1/catalog/region", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, 200, s.cfg.Region) })
@@ -128,6 +177,13 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /v1/auth/email-code", s.handleEmailCode)
 	m.HandleFunc("POST /v1/auth/logout", s.withSession(s.handleLogout))
 	m.HandleFunc("GET /v1/me", s.withSession(s.handleMe))
+
+	// Hosted accounts and API keys (need a Store)
+	m.HandleFunc("GET /v1/account", s.withSession(s.handleAccount))
+	m.HandleFunc("GET /v1/keys", s.withSession(s.handleKeysList))
+	m.HandleFunc("POST /v1/keys", s.withSession(s.handleKeysCreate))
+	m.HandleFunc("DELETE /v1/keys/{id}", s.withSession(s.handleKeysDelete))
+	m.Handle("/mcp", s.mcpHandler())
 
 	// Printers (cloud-bound or LAN-registered)
 	m.HandleFunc("GET /v1/devices", s.withSession(s.handleDevices))
@@ -174,6 +230,15 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 
 // writeCallErr maps cloud/MQTT errors onto HTTP statuses.
 func writeCallErr(w http.ResponseWriter, err error) {
+	var ua errUnauthorized
+	if errors.As(err, &ua) {
+		writeErr(w, http.StatusUnauthorized, ua.Error())
+		return
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "not found")
+		return
+	}
 	var ae *cloud.APIError
 	if errors.As(err, &ae) {
 		var detail any
@@ -183,7 +248,7 @@ func writeCallErr(w http.ResponseWriter, err error) {
 		writeJSON(w, ae.StatusCode, apiError{Error: ae.Message, Code: ae.Code, Detail: detail})
 		return
 	}
-	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "no reply within") {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errNoReport) || strings.Contains(err.Error(), "no reply within") {
 		writeErr(w, http.StatusGatewayTimeout, err.Error())
 		return
 	}
@@ -206,27 +271,11 @@ func decodeBody(r *http.Request, v any) error {
 	return dec.Decode(v)
 }
 
-func bearer(r *http.Request) string {
-	h := r.Header.Get("Authorization")
-	if strings.HasPrefix(strings.ToLower(h), "bearer ") {
-		return strings.TrimSpace(h[7:])
-	}
-	if t := r.Header.Get("X-Bambu-Token"); t != "" {
-		return t
-	}
-	return ""
-}
-
 type sessionHandler func(w http.ResponseWriter, r *http.Request, sess *session)
 
 func (s *Server) withSession(h sessionHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		tok := bearer(r)
-		if tok == "" {
-			writeErr(w, http.StatusUnauthorized, "Authorization: Bearer <bambu access token> required")
-			return
-		}
-		sess, err := s.sessionFor(r.Context(), tok)
+		sess, err := s.authenticate(r.Context(), credential(r))
 		if err != nil {
 			writeCallErr(w, err)
 			return
@@ -250,17 +299,17 @@ func (s *Server) printerClient(w http.ResponseWriter, r *http.Request) (*mqtt.Cl
 		}
 		return c, sn, true
 	}
-	tok := bearer(r)
-	if tok == "" {
-		writeErr(w, http.StatusUnauthorized, "printer is not registered for LAN mode; send Authorization: Bearer <bambu access token> for cloud control")
+	cred := credential(r)
+	if cred == "" {
+		writeErr(w, http.StatusUnauthorized, "printer is not registered for LAN mode; send Authorization: Bearer <bambu access token or API key> for cloud control")
 		return nil, sn, false
 	}
-	sess, err := s.sessionFor(r.Context(), tok)
+	sess, err := s.authenticate(r.Context(), cred)
 	if err != nil {
 		writeCallErr(w, err)
 		return nil, sn, false
 	}
-	c, err := sess.MQTT(r.Context(), s.cfg.Region, s.cfg.HardwareID)
+	c, err := sess.MQTT(r.Context(), s.cfg.Region)
 	if err != nil {
 		writeCallErr(w, err)
 		return nil, sn, false
@@ -296,6 +345,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeCallErr(w, err)
 		return
 	}
+	s.rememberLogin(r.Context(), req.Account, res)
 	writeJSON(w, 200, res)
 }
 
@@ -313,6 +363,7 @@ func (s *Server) handleTFA(w http.ResponseWriter, r *http.Request) {
 		writeCallErr(w, err)
 		return
 	}
+	s.rememberLogin(r.Context(), "", res)
 	writeJSON(w, 200, res)
 }
 
@@ -335,16 +386,21 @@ func (s *Server) handleEmailCode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
+// handleLogout invalidates the Bambu token at the cloud and, when the account
+// is stored here, forgets its session so its API keys stop working. Keys
+// themselves may not sign the account out.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, sess *session) {
-	err := sess.cloud.Logout(r.Context())
-	s.mu.Lock()
-	delete(s.sessions, tokenKey(sess.token))
-	s.mu.Unlock()
-	sess.mu.Lock()
-	if sess.mqtt != nil {
-		sess.mqtt.Close()
+	if sess.viaKey != nil {
+		writeErr(w, http.StatusForbidden, "API keys cannot sign the account out; use a Bambu login session")
+		return
 	}
-	sess.mu.Unlock()
+	err := sess.cloud.Logout(r.Context())
+	if s.store != nil && sess.account != nil {
+		if cerr := s.store.ClearSession(r.Context(), sess.userID); cerr != nil && !errors.Is(cerr, store.ErrNotFound) {
+			s.log.Printf("clear stored session for %s: %v", sess.userID, cerr)
+		}
+	}
+	s.dropSessions(sess.userID, sess.token)
 	if err != nil {
 		writeCallErr(w, err)
 		return
@@ -377,27 +433,41 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ctx := r.Context()
-	if err := c.Subscribe(ctx, sn); err != nil {
+	st, err := s.printerState(r.Context(), c, sn, r.URL.Query().Get("refresh") == "1")
+	if err != nil {
 		writeCallErr(w, err)
-		return
-	}
-	st := c.Snapshot(sn)
-	refresh := r.URL.Query().Get("refresh") == "1" || st == nil || len(st.Print) == 0
-	if refresh {
-		// pushing/pushall makes the printer send a full status snapshot.
-		if _, err := c.Send(ctx, sn, mqtt.PushAll()); err != nil {
-			// Older firmware acks pushall on the print module instead; fall back to a short wait.
-			time.Sleep(1500 * time.Millisecond)
-		}
-		st = c.Snapshot(sn)
-	}
-	if st == nil {
-		writeErr(w, http.StatusGatewayTimeout, "no report received from printer yet")
 		return
 	}
 	writeJSON(w, 200, st)
 }
+
+// printerState subscribes to the printer and returns its merged report
+// snapshot, asking for a full pushall when none (or a refresh) is wanted.
+func (s *Server) printerState(ctx context.Context, c *mqtt.Client, sn string, refresh bool) (*mqtt.DeviceState, error) {
+	if err := c.Subscribe(ctx, sn); err != nil {
+		return nil, err
+	}
+	st := c.Snapshot(sn)
+	if refresh || st == nil || len(st.Print) == 0 {
+		// pushing/pushall makes the printer send a full status snapshot.
+		if _, err := c.Send(ctx, sn, mqtt.PushAll()); err != nil {
+			// Older firmware acks pushall on the print module instead; fall back to a short wait.
+			select {
+			case <-time.After(1500 * time.Millisecond):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		st = c.Snapshot(sn)
+	}
+	if st == nil {
+		return nil, errNoReport
+	}
+	return st, nil
+}
+
+// errNoReport is returned when the printer has not reported anything yet.
+var errNoReport = errors.New("no report received from printer yet")
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	c, sn, ok := s.printerClient(w, r)
@@ -465,37 +535,52 @@ type commandResult struct {
 	Secured bool `json:"secured"`
 }
 
+// failed reports whether the printer rejected the command (mqtt.Response.Err).
+func (r *commandResult) failed() bool {
+	return r.Errno != 0 || r.ErrCode != 0 || (r.Result != "" && !strings.EqualFold(r.Result, "success"))
+}
+
 func (s *Server) sendCommand(w http.ResponseWriter, r *http.Request, c *mqtt.Client, sn string, cmd mqtt.Command) {
-	wait := r.URL.Query().Get("wait") != "0"
-	sent := mqtt.Envelope("", "<n>", cmd)
-	if !wait {
+	if r.URL.Query().Get("wait") == "0" {
 		seq, err := c.Publish(r.Context(), sn, cmd)
 		if err != nil {
 			writeCallErr(w, err)
 			return
 		}
-		writeJSON(w, http.StatusAccepted, commandResult{SequenceID: seq, Module: cmd.Module, Command: cmd.Command, Sent: sent})
+		writeJSON(w, http.StatusAccepted, commandResult{SequenceID: seq, Module: cmd.Module, Command: cmd.Command, Sent: mqtt.Envelope("", "<n>", cmd)})
 		return
 	}
-	resp, err := c.Send(r.Context(), sn, cmd)
+	res, err := s.execCommand(r.Context(), c, sn, cmd)
 	if err != nil {
 		writeCallErr(w, err)
 		return
 	}
+	status := 200
+	if res.failed() {
+		status = http.StatusUnprocessableEntity
+	}
+	writeJSON(w, status, res)
+}
+
+// execCommand publishes a command, waits for the printer's reply and, on the
+// app's "verification failed" errnos, establishes the secure channel and
+// retries signed. The result carries the printer's verdict; err is transport.
+func (s *Server) execCommand(ctx context.Context, c *mqtt.Client, sn string, cmd mqtt.Command) (*commandResult, error) {
+	sent := mqtt.Envelope("", "<n>", cmd)
+	resp, err := c.Send(ctx, sn, cmd)
+	if err != nil {
+		return nil, err
+	}
 	secured := false
 	if mqtt.IsSecurityError(resp) {
 		// Mirror pv9: refresh the app cert, run the exchange, retry signed.
-		if _, xerr := s.establishSecure(r.Context(), c, sn); xerr != nil {
+		if _, xerr := s.establishSecure(ctx, c, sn); xerr != nil {
 			s.log.Printf("secure exchange with %s failed: %v", sn, xerr)
-		} else if retry, rerr := c.Send(r.Context(), sn, cmd); rerr == nil {
+		} else if retry, rerr := c.Send(ctx, sn, cmd); rerr == nil {
 			resp, secured = retry, true
 		}
 	}
-	status := 200
-	if resp.Err() != nil {
-		status = http.StatusUnprocessableEntity
-	}
-	writeJSON(w, status, commandResult{SequenceID: resp.SequenceID, Module: resp.Module, Command: resp.Command, Result: resp.Result, Reason: resp.Reason, Errno: resp.Errno, ErrCode: resp.ErrCode, Reply: resp.Body, Sent: sent, Secured: secured || c.Secure(sn) != nil})
+	return &commandResult{SequenceID: resp.SequenceID, Module: resp.Module, Command: resp.Command, Result: resp.Result, Reason: resp.Reason, Errno: resp.Errno, ErrCode: resp.ErrCode, Reply: resp.Body, Sent: sent, Secured: secured || c.Secure(sn) != nil}, nil
 }
 
 // establishSecure fetches the shared app certificate and runs the

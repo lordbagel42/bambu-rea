@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <title>bambu-api · sign in</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root { color-scheme: light dark; font: 15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+      body { margin: 0; display: flex; justify-content: center; padding: 48px 16px; background: Canvas; color: CanvasText; }
+      main { width: 100%; max-width: 440px; }
+      h1 { font-size: 22px; margin: 0 0 4px; }
+      p.lead { margin: 0 0 24px; opacity: .75; }
+      section { border: 1px solid color-mix(in srgb, CanvasText 15%, transparent); border-radius: 10px; padding: 20px; margin-bottom: 16px; }
+      section[hidden] { display: none; }
+      h2 { font-size: 16px; margin: 0 0 12px; }
+      label { display: block; font-size: 13px; margin: 12px 0 4px; opacity: .8; }
+      input { width: 100%; box-sizing: border-box; padding: 9px 10px; border-radius: 6px; border: 1px solid color-mix(in srgb, CanvasText 25%, transparent); background: Field; color: FieldText; font: inherit; }
+      button { margin-top: 14px; padding: 9px 14px; border-radius: 6px; border: 0; background: #16a34a; color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+      button.secondary { background: transparent; color: inherit; border: 1px solid color-mix(in srgb, CanvasText 25%, transparent); }
+      button:disabled { opacity: .5; cursor: wait; }
+      .error { color: #dc2626; font-size: 13px; margin-top: 10px; white-space: pre-wrap; }
+      .hint { font-size: 13px; opacity: .7; margin-top: 10px; }
+      code, pre { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+      pre { background: color-mix(in srgb, CanvasText 8%, transparent); padding: 10px; border-radius: 6px; overflow-x: auto; user-select: all; }
+      table { width: 100%; border-collapse: collapse; font-size: 14px; }
+      td, th { text-align: left; padding: 6px 4px; border-bottom: 1px solid color-mix(in srgb, CanvasText 10%, transparent); }
+      td.actions { text-align: right; }
+      td button { margin: 0; padding: 4px 8px; font-size: 13px; }
+      .row { display: flex; gap: 8px; align-items: flex-end; }
+      .row > div { flex: 1; }
+      .row button { margin-top: 0; white-space: nowrap; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>bambu-api</h1>
+      <p class="lead">Sign in with your Bambu Lab account to create API keys that act as that account. Your password goes straight to Bambu's login endpoint, encrypted the way the Handy app does it; this server stores only the resulting session token.</p>
+
+      <section id="step-login">
+        <h2>Sign in</h2>
+        <form id="form-login">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" autocomplete="username" required />
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required />
+          <button type="submit">Sign in</button>
+          <div class="error" id="err-login"></div>
+        </form>
+      </section>
+
+      <section id="step-code" hidden>
+        <h2>Email verification</h2>
+        <p class="hint">Bambu sent a one-time code to <span id="code-email"></span> because this is a new device. Enter it to continue.</p>
+        <form id="form-code">
+          <label for="code">Verification code</label>
+          <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required />
+          <button type="submit">Continue</button>
+          <button type="button" class="secondary" id="resend">Send again</button>
+          <div class="error" id="err-code"></div>
+        </form>
+      </section>
+
+      <section id="step-tfa" hidden>
+        <h2>Two-factor code</h2>
+        <form id="form-tfa">
+          <label for="tfa">Code from your authenticator app</label>
+          <input id="tfa" name="tfa" inputmode="numeric" autocomplete="one-time-code" required />
+          <button type="submit">Continue</button>
+          <div class="error" id="err-tfa"></div>
+        </form>
+      </section>
+
+      <section id="step-keys" hidden>
+        <h2>API keys for <span id="who"></span></h2>
+        <form id="form-key" class="row">
+          <div>
+            <label for="keyname">New key name</label>
+            <input id="keyname" name="keyname" placeholder="e.g. laptop, home-assistant" />
+          </div>
+          <button type="submit">Create key</button>
+        </form>
+        <div class="error" id="err-keys"></div>
+        <div id="new-key" hidden>
+          <p class="hint">Copy this key now; it is shown only once. Send it as <code>Authorization: Bearer …</code> (REST and <code>/mcp</code>) or <code>X-API-Key</code>.</p>
+          <pre id="new-key-value"></pre>
+        </div>
+        <table id="keys"><tbody></tbody></table>
+        <p class="hint">Keys keep working through this account's latest sign-in here. Signing out (<code>POST /v1/auth/logout</code>) disables them until you sign in again. <a href="/docs">API reference</a></p>
+        <button type="button" class="secondary" id="logout">Sign out everywhere</button>
+      </section>
+    </main>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const state = { email: '', token: '', tfaKey: '' };
+
+      async function api(method, path, body, token) {
+        const headers = { 'Content-Type': 'application/json' };
+        if (token) headers.Authorization = 'Bearer ' + token;
+        const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+        const text = await res.text();
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch { data = { error: text }; }
+        if (!res.ok) throw new Error((data && data.error) || res.statusText);
+        return data;
+      }
+
+      function show(step) {
+        for (const id of ['step-login', 'step-code', 'step-tfa', 'step-keys']) $(id).hidden = id !== step;
+      }
+
+      function busy(form, on) {
+        for (const el of form.querySelectorAll('button, input')) el.disabled = on;
+      }
+
+      // Follow the app's login state machine: password → emailed code → TOTP.
+      async function handleLoginResult(res) {
+        if (res.accessToken) {
+          state.token = res.accessToken;
+          await loadKeys();
+          show('step-keys');
+          return;
+        }
+        if (res.loginType === 'verifyCode') {
+          await api('POST', '/v1/auth/email-code', { email: state.email, type: 'codeLogin' });
+          $('code-email').textContent = state.email;
+          show('step-code');
+          return;
+        }
+        if (res.loginType === 'tfa') {
+          state.tfaKey = res.tfaKey;
+          show('step-tfa');
+          return;
+        }
+        throw new Error(res.message || ('unexpected login response (loginType=' + res.loginType + ')'));
+      }
+
+      $('form-login').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        $('err-login').textContent = '';
+        busy(e.target, true);
+        try {
+          state.email = $('email').value.trim();
+          await handleLoginResult(await api('POST', '/v1/auth/login', { account: state.email, password: $('password').value }));
+        } catch (err) {
+          $('err-login').textContent = err.message;
+        } finally {
+          busy(e.target, false);
+        }
+      });
+
+      $('form-code').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        $('err-code').textContent = '';
+        busy(e.target, true);
+        try {
+          await handleLoginResult(await api('POST', '/v1/auth/login', { account: state.email, code: $('code').value.trim() }));
+        } catch (err) {
+          $('err-code').textContent = err.message;
+        } finally {
+          busy(e.target, false);
+        }
+      });
+
+      $('resend').addEventListener('click', async () => {
+        $('err-code').textContent = '';
+        try {
+          await api('POST', '/v1/auth/email-code', { email: state.email, type: 'codeLogin' });
+          $('err-code').textContent = 'Sent.';
+        } catch (err) {
+          $('err-code').textContent = err.message;
+        }
+      });
+
+      $('form-tfa').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        $('err-tfa').textContent = '';
+        busy(e.target, true);
+        try {
+          await handleLoginResult(await api('POST', '/v1/auth/tfa', { tfaKey: state.tfaKey, tfaCode: $('tfa').value.trim() }));
+        } catch (err) {
+          $('err-tfa').textContent = err.message;
+        } finally {
+          busy(e.target, false);
+        }
+      });
+
+      async function loadKeys() {
+        const acct = await api('GET', '/v1/account', undefined, state.token);
+        $('who').textContent = acct.email || ('uid ' + acct.uid);
+        const { keys } = await api('GET', '/v1/keys', undefined, state.token);
+        const tbody = $('keys').querySelector('tbody');
+        tbody.replaceChildren();
+        if (!keys.length) {
+          const tr = document.createElement('tr');
+          const td = document.createElement('td');
+          td.colSpan = 4;
+          td.className = 'hint';
+          td.textContent = 'No keys yet.';
+          tr.append(td);
+          tbody.append(tr);
+          return;
+        }
+        for (const k of keys) {
+          const tr = document.createElement('tr');
+          const cells = [k.name || '(unnamed)', k.prefix + '…', new Date(k.createdAt).toLocaleString(), k.lastUsedAt ? 'used ' + new Date(k.lastUsedAt).toLocaleString() : 'never used'];
+          for (const c of cells) {
+            const td = document.createElement('td');
+            td.textContent = c;
+            tr.append(td);
+          }
+          const td = document.createElement('td');
+          td.className = 'actions';
+          const del = document.createElement('button');
+          del.type = 'button';
+          del.className = 'secondary';
+          del.textContent = 'Revoke';
+          del.addEventListener('click', async () => {
+            if (!confirm('Revoke key ' + k.prefix + '…?')) return;
+            try {
+              await api('DELETE', '/v1/keys/' + encodeURIComponent(k.id), undefined, state.token);
+              await loadKeys();
+            } catch (err) {
+              $('err-keys').textContent = err.message;
+            }
+          });
+          td.append(del);
+          tr.append(td);
+          tbody.append(tr);
+        }
+      }
+
+      $('form-key').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        $('err-keys').textContent = '';
+        busy(e.target, true);
+        try {
+          const created = await api('POST', '/v1/keys', { name: $('keyname').value.trim() }, state.token);
+          $('new-key-value').textContent = created.key;
+          $('new-key').hidden = false;
+          $('keyname').value = '';
+          await loadKeys();
+        } catch (err) {
+          $('err-keys').textContent = err.message;
+        } finally {
+          busy(e.target, false);
+        }
+      });
+
+      $('logout').addEventListener('click', async () => {
+        if (!confirm('Sign out? Every API key for this account stops working until you sign in again.')) return;
+        try {
+          await api('POST', '/v1/auth/logout', undefined, state.token);
+        } catch (err) {
+          $('err-keys').textContent = err.message;
+        }
+        state.token = '';
+        $('new-key').hidden = true;
+        $('password').value = '';
+        show('step-login');
+      });
+    </script>
+  </body>
+</html>
