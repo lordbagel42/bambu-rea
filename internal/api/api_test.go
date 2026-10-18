@@ -350,6 +350,20 @@ func TestMCPToolsRunAsTheKeyOwner(t *testing.T) {
 		t.Fatalf("whoami: %+v", res)
 	}
 
+	// structuredContent must be a JSON object (MCP spec); list_commands used to return a bare array,
+	// which strict clients such as Executor reject.
+	res, err = sess.CallTool(ctx, &mcp.CallToolParams{Name: "list_commands", Arguments: map[string]any{"module": "system"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmds, ok := res.StructuredContent.(map[string]any)
+	if res.IsError || !ok {
+		t.Fatalf("list_commands structuredContent is not an object: %T %+v", res.StructuredContent, res)
+	}
+	if list, _ := cmds["commands"].([]any); len(list) == 0 {
+		t.Fatalf("list_commands returned no commands: %+v", cmds)
+	}
+
 	// A Bambu token is not accepted on the MCP endpoint, nor is a missing key.
 	if r := do(t, hs, "POST", "/mcp", token, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "ping"}); r.status != 401 {
 		t.Fatalf("mcp with bambu token: %d %s", r.status, r.raw)

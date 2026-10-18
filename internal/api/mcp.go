@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -184,7 +185,7 @@ func (s *Server) addMCPTools(server *mcp.Server) {
 				out = append(out, e)
 			}
 			sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-			return nil, out, nil
+			return nil, map[string]any{"commands": out}, nil
 		})
 
 	mcp.AddTool(server, &mcp.Tool{Name: "send_command", Description: "Send a catalogued command to a printer and wait for its reply. Changes printer state (pause, resume, stop, temperatures, fans, lights, speed, AMS, start a print) — only use when the user explicitly asks.", Annotations: mutating},
@@ -246,7 +247,10 @@ func (s *Server) addMCPTools(server *mcp.Server) {
 			}
 			var raw []byte
 			err = sess.cloud.Do(ctx, cloud.Request{Method: http.MethodGet, Path: "user-service/my/tasks", Query: url.Values{"limit": {fmt.Sprint(limit)}}}, &raw)
-			return nil, json.RawMessage(raw), err
+			if err != nil {
+				return nil, nil, err
+			}
+			return nil, structuredObject(raw), nil
 		})
 
 	mcp.AddTool(server, &mcp.Tool{Name: "cloud_request", Description: "Call any Bambu cloud endpoint as the account, with the app's headers (see GET /v1/catalog/endpoints for the 396 known paths). Prefer the specific tools; non-GET methods change account state.", Annotations: &mcp.ToolAnnotations{OpenWorldHint: boolPtr(true)}},
@@ -283,9 +287,21 @@ func (s *Server) addMCPTools(server *mcp.Server) {
 			if err != nil {
 				return nil, nil, err
 			}
-			if len(raw) == 0 || !json.Valid(raw) {
-				return nil, map[string]any{"ok": true, "body": string(raw)}, nil
-			}
-			return nil, json.RawMessage(raw), nil
+			return nil, structuredObject(raw), nil
 		})
+}
+
+// structuredObject shapes an upstream response body into a valid MCP
+// structuredContent value, which the spec requires to be a JSON object. JSON
+// objects pass through; arrays and scalars are wrapped as {"result": ...};
+// empty or non-JSON bodies become {"ok": true, "body": "..."}.
+func structuredObject(raw []byte) any {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || !json.Valid(trimmed) {
+		return map[string]any{"ok": true, "body": string(raw)}
+	}
+	if trimmed[0] == '{' {
+		return json.RawMessage(trimmed)
+	}
+	return map[string]any{"result": json.RawMessage(trimmed)}
 }
