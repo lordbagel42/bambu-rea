@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -436,10 +437,25 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, sess *prin
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
-// isLogoutPath recognises the cloud's logout endpoint in a passthrough request,
-// so it cannot be used to skip handleLogout's rules.
+// isLogoutPath recognises the cloud's logout endpoint in a passthrough request
+// (after cleanCloudPath), so it cannot be used to skip handleLogout's rules.
 func isLogoutPath(method, path string) bool {
-	return method == http.MethodPost && strings.Trim(path, "/") == "user-service/user/logout"
+	return method == http.MethodPost && path == "user-service/user/logout"
+}
+
+// cleanCloudPath normalises a passthrough service path the way the cloud's web
+// server would ("..", "." and "//" resolved, no leading slash), so rules keyed
+// on a path cannot be dodged by spelling it differently. Escapes, queries and
+// fragments are refused: queries go in the query string.
+func cleanCloudPath(in string) (string, error) {
+	if strings.ContainsAny(in, "?#%") {
+		return "", errors.New("service path must not contain '?', '#' or '%'")
+	}
+	p := strings.TrimPrefix(path.Clean("/"+in), "/")
+	if p == "" {
+		return "", errors.New("service path required, e.g. iot-service/api/user/bind")
+	}
+	return p, nil
 }
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, sess *principal) {
@@ -901,9 +917,9 @@ func (s *Server) handleLANDelete(w http.ResponseWriter, r *http.Request) {
 // caller's token and the app's standard headers. Query string and JSON body are
 // passed through; IoT-signed endpoints get the certificate headers automatically.
 func (s *Server) handleCloud(w http.ResponseWriter, r *http.Request, sess *principal) {
-	path := r.PathValue("path")
-	if path == "" {
-		writeErr(w, 400, "service path required, e.g. /v1/cloud/iot-service/api/user/bind")
+	path, err := cleanCloudPath(r.PathValue("path"))
+	if err != nil {
+		writeErr(w, 400, err.Error())
 		return
 	}
 	if isLogoutPath(r.Method, path) {
@@ -949,7 +965,7 @@ func (s *Server) handleCloud(w http.ResponseWriter, r *http.Request, sess *princ
 	}
 	q := url.Values(r.URL.Query())
 	var raw []byte
-	err := sess.cloud.Do(r.Context(), cloud.Request{Method: r.Method, Path: path, Query: q, Headers: h, Body: body, Signed: signed}, &raw)
+	err = sess.cloud.Do(r.Context(), cloud.Request{Method: r.Method, Path: path, Query: q, Headers: h, Body: body, Signed: signed}, &raw)
 	if err != nil {
 		writeCallErr(w, err)
 		return

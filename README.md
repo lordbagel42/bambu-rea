@@ -246,6 +246,9 @@ curl $B 'localhost:8080/v1/cloud/user-service/my/tasks?limit=20'
 curl $B 'localhost:8080/v1/cloud/mall-app-bff/...'        # routed to ap-store-api.bambulab.com
 ```
 
+The service path is normalised (`.`, `..` and `//` resolved) and may not contain
+`%`, `?` or `#`; put query parameters in the query string.
+
 Endpoints the app signs with its IoT app certificate are signed automatically
 (`x-bbl-app-certification-id`, `x-bbl-device-security-sign`, `X-BBL-Client-ID`)
 using the fetched or supplied app certificate; `X-Bambu-Signed: 1` forces signing

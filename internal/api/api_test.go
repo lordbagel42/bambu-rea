@@ -249,8 +249,10 @@ func TestHostedServerHasNoLANRegistryAndKeysCannotLogOutViaPassthrough(t *testin
 	r := do(t, hs, "POST", "/v1/auth/login", "", map[string]string{"account": "me@example.com", "code": "123456"})
 	token := r.body["accessToken"].(string)
 	key := do(t, hs, "POST", "/v1/keys", token, map[string]string{"name": "k"}).body["key"].(string)
-	if r := do(t, hs, "POST", "/v1/cloud/user-service/user/logout", key, nil); r.status != 403 {
-		t.Fatalf("key logout through the passthrough: %d %s", r.status, r.raw)
+	for _, p := range []string{"/v1/cloud/user-service/user/logout", "/v1/cloud/x/%2e%2e/user-service/user/logout", "/v1/cloud/user-service%2F%2Fuser/logout"} {
+		if r := do(t, hs, "POST", p, key, nil); r.status != 403 {
+			t.Fatalf("key logout through the passthrough as %s: %d %s", p, r.status, r.raw)
+		}
 	}
 	if r := do(t, hs, "GET", "/v1/me", key, nil); r.status != 200 {
 		t.Fatalf("key still works after the blocked logout: %d %s", r.status, r.raw)

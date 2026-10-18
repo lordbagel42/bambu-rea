@@ -255,9 +255,9 @@ func (s *Server) addMCPTools(server *mcp.Server) {
 			if method == "" {
 				method = http.MethodGet
 			}
-			path := strings.TrimPrefix(strings.TrimSpace(in.Path), "/")
-			if path == "" {
-				return nil, nil, errors.New("path is required")
+			path, err := cleanCloudPath(strings.TrimSpace(in.Path))
+			if err != nil {
+				return nil, nil, err
 			}
 			if isLogoutPath(method, path) {
 				// MCP callers are always API keys, which may not sign the account out.
