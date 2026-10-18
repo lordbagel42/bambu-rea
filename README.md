@@ -133,7 +133,8 @@ curl -H 'Authorization: Bearer TOKEN' $API/v1/me
 ### API keys
 
 Key management needs the **Bambu token** of an account that has logged in here
-(a key cannot mint keys or sign the account out):
+(a key cannot mint keys or sign the account out); these calls and logout check
+with the cloud that the token is still valid each time:
 
 | Route | Does |
 |---|---|

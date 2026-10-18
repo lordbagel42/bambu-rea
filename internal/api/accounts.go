@@ -52,15 +52,47 @@ func (s *Server) requireStore(w http.ResponseWriter) bool {
 	return true
 }
 
+// loginNotStored answers a login whose session could not be stored: the token
+// Bambu issued is signed out again rather than handed back half-working.
+func (s *Server) loginNotStored(w http.ResponseWriter, r *http.Request, res *cloud.LoginResult, err error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+	defer cancel()
+	if lerr := s.anon.WithToken(res.AccessToken).Logout(ctx); lerr != nil {
+		s.log.Printf("sign out unstored login: %v", lerr)
+	}
+	writeErr(w, http.StatusInternalServerError, "login succeeded at Bambu but this server could not store the session; try again: "+err.Error())
+}
+
 // requireLoginSession limits key management to callers holding a Bambu token
 // for an account that has logged in here, so a leaked API key cannot mint more.
-func (s *Server) requireLoginSession(w http.ResponseWriter, sess *principal) bool {
+func (s *Server) requireLoginSession(w http.ResponseWriter, r *http.Request, sess *principal) bool {
 	if sess.key != nil {
 		writeErr(w, http.StatusForbidden, "API keys cannot manage keys; authenticate with the Bambu access token from /v1/auth/login")
 		return false
 	}
 	if sess.account == nil {
 		writeErr(w, http.StatusForbidden, "this account has not logged in through this server; call /v1/auth/login here first")
+		return false
+	}
+	return s.requireLiveToken(w, r, sess)
+}
+
+// requireLiveToken asks the cloud whether the caller's Bambu token is still
+// valid. Cached sessions are verified once, so the rare account-level actions
+// (key management, logout) check again: a token revoked elsewhere must not keep
+// managing the account here.
+func (s *Server) requireLiveToken(w http.ResponseWriter, r *http.Request, sess *principal) bool {
+	if s.store == nil {
+		return true
+	}
+	if _, err := sess.cloud.GetUserServiceMyProfile(r.Context(), nil); err != nil {
+		var ae *cloud.APIError
+		if errors.As(err, &ae) && (ae.StatusCode == http.StatusUnauthorized || ae.StatusCode == http.StatusForbidden) {
+			s.dropSessions("", sess.token)
+			writeErr(w, http.StatusUnauthorized, "the Bambu cloud no longer accepts this access token; log in again")
+			return false
+		}
+		writeCallErr(w, err)
 		return false
 	}
 	return true
@@ -90,7 +122,7 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request, sess *pri
 }
 
 func (s *Server) handleKeysList(w http.ResponseWriter, r *http.Request, sess *principal) {
-	if !s.requireStore(w) || !s.requireLoginSession(w, sess) {
+	if !s.requireStore(w) || !s.requireLoginSession(w, r, sess) {
 		return
 	}
 	keys, err := s.store.ListKeys(r.Context(), sess.userID)
@@ -107,7 +139,7 @@ type createdKey struct {
 }
 
 func (s *Server) handleKeysCreate(w http.ResponseWriter, r *http.Request, sess *principal) {
-	if !s.requireStore(w) || !s.requireLoginSession(w, sess) {
+	if !s.requireStore(w) || !s.requireLoginSession(w, r, sess) {
 		return
 	}
 	var req struct {
@@ -130,7 +162,7 @@ func (s *Server) handleKeysCreate(w http.ResponseWriter, r *http.Request, sess *
 }
 
 func (s *Server) handleKeysDelete(w http.ResponseWriter, r *http.Request, sess *principal) {
-	if !s.requireStore(w) || !s.requireLoginSession(w, sess) {
+	if !s.requireStore(w) || !s.requireLoginSession(w, r, sess) {
 		return
 	}
 	err := s.store.DeleteKey(r.Context(), sess.userID, r.PathValue("id"))

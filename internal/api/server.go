@@ -365,7 +365,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.rememberLogin(r.Context(), req.Account, res); err != nil {
-		writeErr(w, http.StatusInternalServerError, "login succeeded at Bambu but this server could not store the session; try again: "+err.Error())
+		s.loginNotStored(w, r, res, err)
 		return
 	}
 	writeJSON(w, 200, res)
@@ -386,7 +386,7 @@ func (s *Server) handleTFA(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.rememberLogin(r.Context(), "", res); err != nil {
-		writeErr(w, http.StatusInternalServerError, "login succeeded at Bambu but this server could not store the session; try again: "+err.Error())
+		s.loginNotStored(w, r, res, err)
 		return
 	}
 	writeJSON(w, 200, res)
@@ -417,6 +417,9 @@ func (s *Server) handleEmailCode(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, sess *principal) {
 	if sess.key != nil {
 		writeErr(w, http.StatusForbidden, "API keys cannot sign the account out; use a Bambu login session")
+		return
+	}
+	if !s.requireLiveToken(w, r, sess) {
 		return
 	}
 	// The stored session goes first, on a context the client cannot cancel
