@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -241,6 +242,9 @@ func buildOpenAPI(region cloud.Region, publicURL string, hosted bool) map[string
 	}
 
 	tags := []any{"meta", "auth", "account", "mcp", "printer", "security", "lan", "commands", "cloud"}
+	if hosted {
+		tags = slices.DeleteFunc(tags, func(t any) bool { return t == "lan" })
+	}
 	mods := mqtt.Modules()
 	sort.Strings(mods)
 	for _, m := range mods {
