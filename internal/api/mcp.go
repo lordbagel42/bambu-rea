@@ -85,10 +85,6 @@ func (s *Server) mcpPrinter(ctx context.Context, req *mcp.CallToolRequest, seria
 
 func boolPtr(b bool) *bool { return &b }
 
-type serialArgs struct {
-	Serial string `json:"serial" jsonschema:"printer serial number, from list_printers"`
-}
-
 type statusArgs struct {
 	Serial  string `json:"serial" jsonschema:"printer serial number, from list_printers"`
 	Refresh bool   `json:"refresh,omitempty" jsonschema:"ask the printer for a full report before answering"`
