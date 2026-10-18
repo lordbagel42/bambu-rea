@@ -71,9 +71,11 @@ go build ./cmd/bambu-api
 `-db` turns on the hosted mode below (accounts, API keys, `/login`, `/mcp`);
 `-data-key` (32 bytes, hex) encrypts the stored Bambu tokens at rest. Flags also
 read `BAMBU_API_ADDR`, `BAMBU_REGION`, `BAMBU_DB`, `BAMBU_DATA_KEY`, `BAMBU_PUBLIC_URL`,
-`BAMBU_CORS_ORIGINS`, `BAMBU_API_KEY` (a static gate on top of per-user auth),
+`BAMBU_CORS_ORIGINS`, `BAMBU_API_KEY` (a static `X-API-Key` gate on top of per-user
+auth; leave it unset on a hosted server, where `X-API-Key` carries per-account keys),
 `BAMBU_HARDWARE_ID`, `BAMBU_APP_CERT`, `BAMBU_APP_KEY`, `BAMBU_LAN_CA`; `BAMBU_ENV_FILE`
-names a dotenv file loaded first, for secrets a scheduler should not see.
+names a dotenv file loaded first, for secrets a scheduler should not see. Secrets
+are read from the environment after flag parsing, so `-h` never prints them.
 `GET /openapi.json` describes every route, including one operation per MQTT command
 and per cloud endpoint, and `GET /docs` renders it with Scalar. The `Dockerfile`
 builds a static binary on a distroless image that expects `/data` as a volume.
@@ -85,10 +87,17 @@ credential is one of two things:
 
 - **A Bambu access token**, straight from the login endpoints below. The server
   is multi-tenant by token; sessions (cloud client, MQTT connection) are created
-  lazily per token and dropped after `-mqtt-idle`.
+  lazily per token and dropped after `-mqtt-idle`. With `-db`, a token the server
+  has not seen is first checked against the cloud (`user-service/my/profile`): the
+  uid in the JWT is never trusted on its own, and a token the cloud rejects gets
+  `401` before it can reach any stored account.
 - **An API key** (`bk_` + 32 url-safe characters), which acts as the Bambu account
   that created it. The key is a handle on the server-side session stored at that
   account's latest login, so it never expires on its own and follows re-logins.
+
+Both kinds work on every `/v1/...` route (including `/v1/devices/{sn}/events` and
+`/v1/cloud/...`) and on `/mcp` (keys only). Only key management and logout need the
+Bambu token.
 
 ### Login
 
@@ -109,7 +118,9 @@ With `-db`, every successful login/TFA on this server also **stores the session*
 (uid, account email, token, refresh token, expiry) under the Bambu uid, creating
 the account on first login with a stable random hardware id that its MQTT client
 id and `X-BBL-Device-ID` use from then on. Logging in again replaces the token;
-all of the account's keys switch to it immediately.
+all of the account's keys switch to it immediately. If the server cannot store
+the session, the login answers `500` (the Bambu token was issued, but no key will
+use it) and should be retried.
 
 ```sh
 curl -X POST $API/v1/auth/login -d '{"account":"me@example.com","password":"..."}'
@@ -130,10 +141,13 @@ Key management needs the **Bambu token** of an account that has logged in here
 | `GET /v1/keys` | `{"keys": [{id, name, prefix, createdAt, lastUsedAt}]}` |
 | `POST /v1/keys {"name"}` | `201` with the same fields plus `key` — the secret, returned once |
 | `DELETE /v1/keys/{id}` | `204`; the key stops working immediately |
-| `POST /v1/auth/logout` | invalidates the token at the cloud **and clears the stored session**: every key of the account answers `401 … signed out` until the next login |
+| `POST /v1/auth/logout` | **clears the stored session** (every key of the account answers `401 … signed out` until the next login), then invalidates the token at the cloud. `POST /v1/cloud/user-service/user/logout` is routed here too |
 
 Statuses: `401` unknown/revoked key or signed-out account, `403` a key tried to
-manage keys or log out, `501` the server runs without `-db`. The browser flow at
+manage keys or log out (also through the cloud passthrough or MCP `cloud_request`),
+`501` the server runs without `-db`. Revoking a key or signing out ends the
+account's open event streams within 30 s: the stream re-checks its credential,
+sends `event: error` with the `401` body and closes. The browser flow at
 `/login` does all of this (sign in with code/2FA, create, list, revoke, sign out);
 a web app does the same calls cross-origin when its origin is in `-cors-origins`.
 
@@ -193,8 +207,10 @@ printer `result != success` yields 422 with the full reply.
 
 ### LAN mode
 
-LAN printers are registered per session with their access code and are reachable
-under the same `/v1/devices/{sn}/...` routes:
+Single-user servers only: the LAN registry is global and unauthenticated, so a
+server started with `-db` (the hosted mode) has no `/v1/lan/...` routes. LAN
+printers are registered with their access code and are reachable under the same
+`/v1/devices/{sn}/...` routes:
 
 ```sh
 curl $B -X POST localhost:8080/v1/lan/devices -d '{"ip":"192.168.1.50","serial":"01P00A...","accessCode":"12345678"}'

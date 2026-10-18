@@ -27,15 +27,23 @@ type session struct {
 	userID     string
 	hardwareID string
 	cloud      *cloud.Client
-	// account is set when the session was resolved through the store (an API
-	// key, or a Bambu token whose owner has logged in here before).
-	account *store.Account
-	// viaKey is the API key that authenticated the request, if any.
-	viaKey *store.APIKey
 
 	mu       sync.Mutex
 	mqtt     *mqtt.Client
 	lastUsed time.Time
+}
+
+// principal is what one request authenticated as: the shared session plus the
+// request's own view of the stored account it is verified to own and the API
+// key it used, if any. Sessions are shared between requests (and between all
+// keys of an account), so per-request facts never live on the session itself.
+type principal struct {
+	*session
+	// account is the stored account behind the credential: the key's account,
+	// or the verified owner of a Bambu token who has logged in here before.
+	account *store.Account
+	// key is the API key that authenticated the request, if any.
+	key *store.APIKey
 }
 
 // lanPrinter is a printer reachable directly over the LAN (no cloud account).
@@ -56,12 +64,13 @@ type lanPrinter struct {
 
 func tokenKey(token string) string {
 	h := sha256.Sum256([]byte(token))
-	return hex.EncodeToString(h[:8])
+	return hex.EncodeToString(h[:])
 }
 
 // userIDFromJWT extracts the numeric uid from the cloud access token without
-// verifying it; the broker and envelope only need the id, and the cloud rejects
-// forged tokens anyway. Bambu tokens carry "username": "u_<uid>" and/or "sub".
+// verifying it. It is only a hint: nothing that grants access to stored state
+// trusts it (see session.verify). Bambu tokens carry "username": "u_<uid>"
+// and/or "sub".
 func userIDFromJWT(token string) string {
 	parts := strings.Split(token, ".")
 	if len(parts) < 2 {
@@ -108,8 +117,8 @@ func credential(r *http.Request) string {
 	return ""
 }
 
-// authenticate resolves the request's credential to a session.
-func (s *Server) authenticate(ctx context.Context, cred string) (*session, error) {
+// authenticate resolves the request's credential to a principal.
+func (s *Server) authenticate(ctx context.Context, cred string) (*principal, error) {
 	if cred == "" {
 		return nil, errUnauthorized("Authorization: Bearer <bambu access token or API key> required")
 	}
@@ -124,19 +133,19 @@ func (s *Server) authenticate(ctx context.Context, cred string) (*session, error
 		if err != nil {
 			return nil, err
 		}
-		sess, err := s.sessionForAccount(ctx, key.AccountUID)
+		p, err := s.sessionForAccount(ctx, key.AccountUID)
 		if err != nil {
 			return nil, err
 		}
-		sess.viaKey = key
-		return sess, nil
+		p.key = key
+		return p, nil
 	}
 	return s.sessionFor(ctx, cred)
 }
 
 // sessionForAccount returns the shared session for a stored account, replacing
 // it when the account has logged in again since.
-func (s *Server) sessionForAccount(ctx context.Context, uid string) (*session, error) {
+func (s *Server) sessionForAccount(ctx context.Context, uid string) (*principal, error) {
 	stored, err := s.store.Session(ctx, uid)
 	if errors.Is(err, store.ErrSignedOut) {
 		return nil, errUnauthorized("account is signed out; log in again to reactivate its API keys")
@@ -156,44 +165,81 @@ func (s *Server) sessionForAccount(ctx context.Context, uid string) (*session, e
 		ok = false
 	}
 	if !ok {
+		// The store only holds tokens this server received from a login.
 		sess = s.newSession(stored.Token, uid, stored.HardwareID)
 		s.sessions[key] = sess
 	}
-	sess.account = &stored.Account
 	sess.lastUsed = time.Now()
 	s.mu.Unlock()
-	return sess, nil
+	return &principal{session: sess, account: &stored.Account}, nil
 }
 
-// sessionFor returns the session for a raw Bambu access token.
-func (s *Server) sessionFor(ctx context.Context, token string) (*session, error) {
+// sessionFor returns the principal for a raw Bambu access token.
+func (s *Server) sessionFor(ctx context.Context, token string) (*principal, error) {
 	key := tokenKey(token)
 	s.mu.Lock()
 	sess, ok := s.sessions[key]
-	if !ok {
-		sess = s.newSession(token, userIDFromJWT(token), s.cfg.HardwareID)
-		s.sessions[key] = sess
+	if ok {
+		sess.lastUsed = time.Now()
 	}
-	sess.lastUsed = time.Now()
 	s.mu.Unlock()
-	if sess.userID == "" {
-		me, err := sess.cloud.GetUserServiceMyProfile(ctx, nil)
-		if err != nil {
-			return nil, fmt.Errorf("resolve user id: %w", err)
+	if !ok {
+		// A new session is verified before it is shared, so a rejected token
+		// never enters the cache and its userID is settled before any other
+		// goroutine can read it. Without a store there is nothing local a
+		// forged token could reach and the cloud rejects it on first use, so
+		// only a token with no uid claim costs a profile call there; with a
+		// store, every token is verified before it can be linked to an account.
+		sess = s.newSession(token, userIDFromJWT(token), s.cfg.HardwareID)
+		if err := sess.verify(ctx, s.store != nil); err != nil {
+			return nil, err
 		}
-		if me.Uid == nil {
-			return nil, errors.New("profile has no uid")
+		s.mu.Lock()
+		if cur, ok := s.sessions[key]; ok {
+			sess = cur // a concurrent request verified the same token first
+		} else {
+			s.sessions[key] = sess
 		}
-		sess.userID = fmt.Sprint(*me.Uid)
-		sess.cloud.UserID = sess.userID
+		sess.lastUsed = time.Now()
+		s.mu.Unlock()
 	}
-	if s.store != nil && sess.account == nil {
+	p := &principal{session: sess}
+	if s.store != nil {
 		// A token whose owner has logged in here before may manage that account.
-		if acct, err := s.store.Account(ctx, sess.userID); err == nil {
-			sess.account = acct
+		acct, err := s.store.Account(ctx, sess.userID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return nil, err
 		}
+		p.account = acct
 	}
-	return sess, nil
+	return p, nil
+}
+
+// verify asks the cloud whose token this is, before the session is shared. A
+// token's uid claim is never trusted on its own when the answer grants access
+// to stored state: the cloud must accept the token and report the same uid.
+func (sess *session) verify(ctx context.Context, always bool) error {
+	if !always && sess.userID != "" {
+		return nil
+	}
+	me, err := sess.cloud.GetUserServiceMyProfile(ctx, nil)
+	if err != nil {
+		var ae *cloud.APIError
+		if errors.As(err, &ae) && (ae.StatusCode == http.StatusUnauthorized || ae.StatusCode == http.StatusForbidden) {
+			return errUnauthorized("the Bambu cloud rejected this access token")
+		}
+		return fmt.Errorf("verify token: %w", err)
+	}
+	if me.Uid == nil {
+		return errors.New("verify token: profile has no uid")
+	}
+	uid := fmt.Sprint(*me.Uid)
+	if sess.userID != "" && sess.userID != uid {
+		return errUnauthorized("access token does not belong to the user it claims")
+	}
+	sess.userID = uid
+	sess.cloud.UserID = uid
+	return nil
 }
 
 func (s *Server) newSession(token, userID, hardwareID string) *session {

@@ -30,6 +30,9 @@ type Config struct {
 	HardwareID string
 	AppCert    *cloud.AppCert // optional captured app certificate for IoT-signed endpoints
 	IdleAfter  time.Duration
+	// RecheckEvery is how often an open event stream re-authenticates its
+	// credential on a hosted server (default 30s).
+	RecheckEvery time.Duration
 	// LANExtraRoots are additional PEM CA bundles trusted for LAN printers.
 	LANExtraRoots [][]byte
 	Logger        *log.Logger
@@ -67,6 +70,9 @@ type Server struct {
 func New(cfg Config) *Server {
 	if cfg.IdleAfter <= 0 {
 		cfg.IdleAfter = 15 * time.Minute
+	}
+	if cfg.RecheckEvery <= 0 {
+		cfg.RecheckEvery = 30 * time.Second
 	}
 	if cfg.HardwareID == "" {
 		cfg.HardwareID = "bambu-rea"
@@ -199,10 +205,14 @@ func (s *Server) routes() {
 	m.HandleFunc("DELETE /v1/devices/{sn}/security", s.handleSecurityDrop)
 	m.HandleFunc("GET /v1/appcert", s.handleAppCert)
 
-	// LAN registry
-	m.HandleFunc("GET /v1/lan/devices", s.handleLANList)
-	m.HandleFunc("POST /v1/lan/devices", s.handleLANAdd)
-	m.HandleFunc("DELETE /v1/lan/devices/{sn}", s.handleLANDelete)
+	// LAN registry: a single-user feature. It is global and unauthenticated
+	// (it lets the caller dial arbitrary hosts and then drive those printers),
+	// so a hosted multi-account server does not offer it.
+	if s.store == nil {
+		m.HandleFunc("GET /v1/lan/devices", s.handleLANList)
+		m.HandleFunc("POST /v1/lan/devices", s.handleLANAdd)
+		m.HandleFunc("DELETE /v1/lan/devices/{sn}", s.handleLANDelete)
+	}
 
 	// Raw cloud passthrough
 	m.HandleFunc("/v1/cloud/{path...}", s.withSession(s.handleCloud))
@@ -214,6 +224,14 @@ type apiError struct {
 	Error  string `json:"error"`
 	Code   int    `json:"code,omitempty"`
 	Detail any    `json:"detail,omitempty"`
+}
+
+func mustJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -271,7 +289,7 @@ func decodeBody(r *http.Request, v any) error {
 	return dec.Decode(v)
 }
 
-type sessionHandler func(w http.ResponseWriter, r *http.Request, sess *session)
+type sessionHandler func(w http.ResponseWriter, r *http.Request, sess *principal)
 
 func (s *Server) withSession(h sessionHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -345,7 +363,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeCallErr(w, err)
 		return
 	}
-	s.rememberLogin(r.Context(), req.Account, res)
+	if err := s.rememberLogin(r.Context(), req.Account, res); err != nil {
+		writeErr(w, http.StatusInternalServerError, "login succeeded at Bambu but this server could not store the session; try again: "+err.Error())
+		return
+	}
 	writeJSON(w, 200, res)
 }
 
@@ -363,7 +384,10 @@ func (s *Server) handleTFA(w http.ResponseWriter, r *http.Request) {
 		writeCallErr(w, err)
 		return
 	}
-	s.rememberLogin(r.Context(), "", res)
+	if err := s.rememberLogin(r.Context(), "", res); err != nil {
+		writeErr(w, http.StatusInternalServerError, "login succeeded at Bambu but this server could not store the session; try again: "+err.Error())
+		return
+	}
 	writeJSON(w, 200, res)
 }
 
@@ -389,26 +413,36 @@ func (s *Server) handleEmailCode(w http.ResponseWriter, r *http.Request) {
 // handleLogout invalidates the Bambu token at the cloud and, when the account
 // is stored here, forgets its session so its API keys stop working. Keys
 // themselves may not sign the account out.
-func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, sess *session) {
-	if sess.viaKey != nil {
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, sess *principal) {
+	if sess.key != nil {
 		writeErr(w, http.StatusForbidden, "API keys cannot sign the account out; use a Bambu login session")
 		return
 	}
-	err := sess.cloud.Logout(r.Context())
+	// The stored session goes first, on a context the client cannot cancel
+	// half-way: once the caller hears "ok" the account's keys must be off.
 	if s.store != nil && sess.account != nil {
-		if cerr := s.store.ClearSession(r.Context(), sess.userID); cerr != nil && !errors.Is(cerr, store.ErrNotFound) {
-			s.log.Printf("clear stored session for %s: %v", sess.userID, cerr)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+		defer cancel()
+		if err := s.store.ClearSession(ctx, sess.userID); err != nil && !errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusInternalServerError, "could not sign out the stored session: "+err.Error())
+			return
 		}
 	}
 	s.dropSessions(sess.userID, sess.token)
-	if err != nil {
+	if err := sess.cloud.Logout(r.Context()); err != nil {
 		writeCallErr(w, err)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
-func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, sess *session) {
+// isLogoutPath recognises the cloud's logout endpoint in a passthrough request,
+// so it cannot be used to skip handleLogout's rules.
+func isLogoutPath(method, path string) bool {
+	return method == http.MethodPost && strings.Trim(path, "/") == "user-service/user/logout"
+}
+
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, sess *principal) {
 	me, err := sess.cloud.GetUserServiceMyProfile(r.Context(), nil)
 	if err != nil {
 		writeCallErr(w, err)
@@ -419,7 +453,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, sess *session)
 
 // ---------------------------------------------------------------- devices
 
-func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request, sess *session) {
+func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request, sess *principal) {
 	list, err := sess.cloud.GetIotServiceApiUserBind(r.Context(), nil)
 	if err != nil {
 		writeCallErr(w, err)
@@ -496,10 +530,25 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	ping := time.NewTicker(25 * time.Second)
 	defer ping.Stop()
+	// A stream outlives the request that opened it, so on a hosted server the
+	// credential is checked again periodically: a revoked key or a signed-out
+	// account loses the stream within a recheck interval.
+	var recheck <-chan time.Time
+	if s.store != nil {
+		t := time.NewTicker(s.cfg.RecheckEvery)
+		defer t.Stop()
+		recheck = t.C
+	}
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-recheck:
+			if _, err := s.authenticate(r.Context(), credential(r)); err != nil {
+				fmt.Fprintf(w, "event: error\ndata: %s\n\n", bytesOneLine(mustJSON(apiError{Error: err.Error(), Code: http.StatusUnauthorized})))
+				fl.Flush()
+				return
+			}
 		case <-ping.C:
 			fmt.Fprint(w, ": ping\n\n")
 			fl.Flush()
@@ -851,10 +900,14 @@ func (s *Server) handleLANDelete(w http.ResponseWriter, r *http.Request) {
 // handleCloud forwards /v1/cloud/<service path> to the Bambu cloud with the
 // caller's token and the app's standard headers. Query string and JSON body are
 // passed through; IoT-signed endpoints get the certificate headers automatically.
-func (s *Server) handleCloud(w http.ResponseWriter, r *http.Request, sess *session) {
+func (s *Server) handleCloud(w http.ResponseWriter, r *http.Request, sess *principal) {
 	path := r.PathValue("path")
 	if path == "" {
 		writeErr(w, 400, "service path required, e.g. /v1/cloud/iot-service/api/user/bind")
+		return
+	}
+	if isLogoutPath(r.Method, path) {
+		s.handleLogout(w, r, sess)
 		return
 	}
 	signed := r.Header.Get("X-Bambu-Signed") == "1"

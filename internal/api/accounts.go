@@ -12,43 +12,35 @@ import (
 )
 
 // rememberLogin persists the Bambu session a successful login produced, so API
-// keys for that account act with the freshest token. It is best effort: the
-// login response is returned to the caller whether or not storage succeeded.
-func (s *Server) rememberLogin(ctx context.Context, account string, res *cloud.LoginResult) {
+// keys for that account act with the freshest token. The uid comes from the
+// cloud's own answer for the new token, never from the token's claims. Storage
+// failures are the caller's to report: a hosted login that was not remembered
+// did not happen as far as the account's keys are concerned.
+func (s *Server) rememberLogin(ctx context.Context, account string, res *cloud.LoginResult) error {
 	if s.store == nil || res == nil || res.AccessToken == "" {
-		return
+		return nil
 	}
-	uid := userIDFromJWT(res.AccessToken)
-	c := s.anon.WithToken(res.AccessToken)
-	// One profile call gives the uid when the token does not carry it and the
-	// account email after a TFA step, where the request has none.
-	if uid == "" || account == "" {
-		me, err := c.GetUserServiceMyProfile(ctx, nil)
-		if err != nil {
-			s.log.Printf("remember login: profile: %v", err)
-		} else {
-			if uid == "" && me.Uid != nil {
-				uid = fmt.Sprint(*me.Uid)
-			}
-			if account == "" {
-				account = me.Account
-			}
-		}
+	me, err := s.anon.WithToken(res.AccessToken).GetUserServiceMyProfile(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("profile for new login: %w", err)
 	}
-	if uid == "" {
-		s.log.Printf("remember login: could not determine uid; session not stored")
-		return
+	if me.Uid == nil {
+		return errors.New("profile for new login has no uid")
+	}
+	uid := fmt.Sprint(*me.Uid)
+	if account == "" {
+		account = me.Account
 	}
 	var exp time.Time
 	if res.ExpiresIn != nil && *res.ExpiresIn > 0 {
 		exp = time.Now().Add(time.Duration(*res.ExpiresIn) * time.Second)
 	}
 	if _, err := s.store.SaveLogin(ctx, store.Login{UID: uid, Email: account, Token: res.AccessToken, RefreshToken: res.RefreshToken, ExpiresAt: exp}); err != nil {
-		s.log.Printf("remember login for %s: %v", uid, err)
-		return
+		return err
 	}
 	// Any cached session for this account now holds a stale token.
 	s.dropSessions(uid, "")
+	return nil
 }
 
 // requireStore rejects account routes on servers without persistence.
@@ -62,8 +54,8 @@ func (s *Server) requireStore(w http.ResponseWriter) bool {
 
 // requireLoginSession limits key management to callers holding a Bambu token
 // for an account that has logged in here, so a leaked API key cannot mint more.
-func (s *Server) requireLoginSession(w http.ResponseWriter, sess *session) bool {
-	if sess.viaKey != nil {
+func (s *Server) requireLoginSession(w http.ResponseWriter, sess *principal) bool {
+	if sess.key != nil {
 		writeErr(w, http.StatusForbidden, "API keys cannot manage keys; authenticate with the Bambu access token from /v1/auth/login")
 		return false
 	}
@@ -81,7 +73,7 @@ type accountView struct {
 }
 
 // handleAccount describes the stored account behind the credential.
-func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request, sess *session) {
+func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request, sess *principal) {
 	if !s.requireStore(w) {
 		return
 	}
@@ -94,10 +86,10 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request, sess *ses
 		writeCallErr(w, err)
 		return
 	}
-	writeJSON(w, 200, accountView{Account: *sess.account, ViaKey: sess.viaKey, Keys: len(keys)})
+	writeJSON(w, 200, accountView{Account: *sess.account, ViaKey: sess.key, Keys: len(keys)})
 }
 
-func (s *Server) handleKeysList(w http.ResponseWriter, r *http.Request, sess *session) {
+func (s *Server) handleKeysList(w http.ResponseWriter, r *http.Request, sess *principal) {
 	if !s.requireStore(w) || !s.requireLoginSession(w, sess) {
 		return
 	}
@@ -114,7 +106,7 @@ type createdKey struct {
 	Key string `json:"key"`
 }
 
-func (s *Server) handleKeysCreate(w http.ResponseWriter, r *http.Request, sess *session) {
+func (s *Server) handleKeysCreate(w http.ResponseWriter, r *http.Request, sess *principal) {
 	if !s.requireStore(w) || !s.requireLoginSession(w, sess) {
 		return
 	}
@@ -137,7 +129,7 @@ func (s *Server) handleKeysCreate(w http.ResponseWriter, r *http.Request, sess *
 	writeJSON(w, http.StatusCreated, createdKey{APIKey: *k, Key: secret})
 }
 
-func (s *Server) handleKeysDelete(w http.ResponseWriter, r *http.Request, sess *session) {
+func (s *Server) handleKeysDelete(w http.ResponseWriter, r *http.Request, sess *principal) {
 	if !s.requireStore(w) || !s.requireLoginSession(w, sess) {
 		return
 	}

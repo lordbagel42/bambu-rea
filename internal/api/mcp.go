@@ -65,7 +65,7 @@ func (s *Server) verifyMCPKey(ctx context.Context, token string, _ *http.Request
 }
 
 // mcpSession is the account session behind a tool call.
-func (s *Server) mcpSession(ctx context.Context, req *mcp.CallToolRequest) (*session, error) {
+func (s *Server) mcpSession(ctx context.Context, req *mcp.CallToolRequest) (*principal, error) {
 	if req.Extra == nil || req.Extra.TokenInfo == nil || req.Extra.TokenInfo.UserID == "" {
 		return nil, errors.New("unauthenticated MCP request")
 	}
@@ -262,6 +262,10 @@ func (s *Server) addMCPTools(server *mcp.Server) {
 			path := strings.TrimPrefix(strings.TrimSpace(in.Path), "/")
 			if path == "" {
 				return nil, nil, errors.New("path is required")
+			}
+			if isLogoutPath(method, path) {
+				// MCP callers are always API keys, which may not sign the account out.
+				return nil, nil, errors.New("API keys cannot sign the account out")
 			}
 			sess, err := s.mcpSession(ctx, req)
 			if err != nil {

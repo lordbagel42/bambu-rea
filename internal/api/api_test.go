@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -24,6 +25,15 @@ import (
 func fakeCloud(t *testing.T) (*httptest.Server, *[]string) {
 	t.Helper()
 	var calls []string
+	var mu sync.Mutex
+	issued := map[string]bool{} // tokens this cloud handed out; the profile rejects all others
+	issue := func(uid string) string {
+		tok := fakeJWT(uid)
+		mu.Lock()
+		issued[tok] = true
+		mu.Unlock()
+		return tok
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/user-service/user/security/pubkey", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"needEncrypt": false})
@@ -33,7 +43,7 @@ func fakeCloud(t *testing.T) (*httptest.Server, *[]string) {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		switch {
 		case req["code"] == "123456":
-			_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": fakeJWT("42"), "refreshToken": "rt", "expiresIn": 3600})
+			_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": issue("42"), "refreshToken": "rt", "expiresIn": 3600})
 		case req["password"] == "tfa":
 			_ = json.NewEncoder(w).Encode(map[string]any{"loginType": "tfa", "tfaKey": "tfa-key"})
 		default:
@@ -41,14 +51,18 @@ func fakeCloud(t *testing.T) (*httptest.Server, *[]string) {
 		}
 	})
 	mux.HandleFunc("POST /v1/user-service/user/tfa/login", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": fakeJWT("43"), "expiresIn": 3600})
+		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": issue("43"), "expiresIn": 3600})
 	})
 	mux.HandleFunc("POST /v1/user-service/user/sendemail/code", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
 	mux.HandleFunc("POST /v1/user-service/user/logout", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
 	mux.HandleFunc("GET /v1/user-service/my/profile", func(w http.ResponseWriter, r *http.Request) {
 		calls = append(calls, r.Header.Get("Authorization")+" "+r.Header.Get("X-BBL-Device-ID"))
-		uid := strings.TrimPrefix(userIDFromJWT(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")), "")
-		if uid == "" {
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		ok := issued[tok]
+		mu.Unlock()
+		uid := userIDFromJWT(tok)
+		if uid == "" || !ok {
 			w.WriteHeader(401)
 			_ = json.NewEncoder(w).Encode(map[string]any{"code": 401, "message": "bad token"})
 			return
@@ -63,6 +77,11 @@ func fakeCloud(t *testing.T) (*httptest.Server, *[]string) {
 func fakeJWT(uid string) string {
 	payload, _ := json.Marshal(map[string]any{"username": "u_" + uid, "exp": 9999999999})
 	return "eyJhbGciOiJIUzI1NiJ9." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
+}
+
+// forgedJWT claims a uid but was never issued by the cloud.
+func forgedJWT(uid string) string {
+	return strings.TrimSuffix(fakeJWT(uid), ".sig") + ".forged"
 }
 
 func newTestServer(t *testing.T, withStore bool) (*httptest.Server, *Server) {
@@ -192,6 +211,56 @@ func TestLoginPersistsSessionAndKeysActAsTheAccount(t *testing.T) {
 	}
 	if r := do(t, hs, "GET", "/v1/me", key, nil); r.status != 401 {
 		t.Fatalf("revoked key accepted: %d %s", r.status, r.raw)
+	}
+}
+
+func TestForgedTokenCannotReachAStoredAccount(t *testing.T) {
+	hs, _ := newTestServer(t, true)
+	if r := do(t, hs, "POST", "/v1/auth/login", "", map[string]string{"account": "me@example.com", "code": "123456"}); r.status != 200 {
+		t.Fatalf("login: %d %s", r.status, r.raw)
+	}
+	forged := forgedJWT("42") // the victim's uid, a signature the cloud never made
+	for _, c := range []struct{ method, path string }{
+		{"GET", "/v1/account"}, {"GET", "/v1/keys"}, {"POST", "/v1/keys"}, {"POST", "/v1/auth/logout"}, {"GET", "/v1/me"},
+	} {
+		body := map[string]string(nil)
+		if c.method == "POST" {
+			body = map[string]string{"name": "evil"}
+		}
+		if r := do(t, hs, c.method, c.path, forged, body); r.status != 401 {
+			t.Errorf("%s %s with a forged token: %d %s", c.method, c.path, r.status, r.raw)
+		}
+	}
+	// The real owner is unaffected: still signed in, still no keys.
+	r := do(t, hs, "GET", "/v1/account", fakeJWT("42"), nil)
+	if r.status != 200 || r.body["signedIn"] != true || r.body["keys"] != float64(0) {
+		t.Fatalf("victim account after forgery attempt: %d %s", r.status, r.raw)
+	}
+}
+
+func TestHostedServerHasNoLANRegistryAndKeysCannotLogOutViaPassthrough(t *testing.T) {
+	hs, _ := newTestServer(t, true)
+	if r := do(t, hs, "POST", "/v1/lan/devices", "", map[string]string{"ip": "127.0.0.1", "serial": "X", "accessCode": "1"}); r.status != 404 {
+		t.Fatalf("LAN registration on a hosted server: %d %s", r.status, r.raw)
+	}
+	if r := do(t, hs, "GET", "/openapi.json", "", nil); strings.Contains(string(r.raw), "/v1/lan/") {
+		t.Fatal("hosted OpenAPI still documents /v1/lan")
+	}
+	r := do(t, hs, "POST", "/v1/auth/login", "", map[string]string{"account": "me@example.com", "code": "123456"})
+	token := r.body["accessToken"].(string)
+	key := do(t, hs, "POST", "/v1/keys", token, map[string]string{"name": "k"}).body["key"].(string)
+	if r := do(t, hs, "POST", "/v1/cloud/user-service/user/logout", key, nil); r.status != 403 {
+		t.Fatalf("key logout through the passthrough: %d %s", r.status, r.raw)
+	}
+	if r := do(t, hs, "GET", "/v1/me", key, nil); r.status != 200 {
+		t.Fatalf("key still works after the blocked logout: %d %s", r.status, r.raw)
+	}
+	// The owner's token through the passthrough signs out for real, keys included.
+	if r := do(t, hs, "POST", "/v1/cloud/user-service/user/logout", token, nil); r.status != 200 {
+		t.Fatalf("token logout through the passthrough: %d %s", r.status, r.raw)
+	}
+	if r := do(t, hs, "GET", "/v1/me", key, nil); r.status != 401 {
+		t.Fatalf("key after passthrough logout: %d %s", r.status, r.raw)
 	}
 }
 

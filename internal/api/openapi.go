@@ -151,12 +151,15 @@ func buildOpenAPI(region cloud.Region, publicURL string, hosted bool) map[string
 		"summary", "The IoT app certificate in use (chain, CRL, ids, validity). The private key is never returned.",
 		"responses", jsonResp("AppCertInfo")))
 
-	paths["/v1/lan/devices"] = obj(
-		"get", obj("tags", []any{"lan"}, "summary", "Registered LAN printers", "responses", jsonResp("list")),
-		"post", obj("tags", []any{"lan"}, "summary", "Register a LAN-mode printer (ip, serial, access code) and connect to it",
-			"requestBody", jsonBody(obj("type", "object", "required", []any{"ip", "serial", "accessCode"}, "properties", obj("ip", obj("type", "string"), "serial", obj("type", "string"), "accessCode", obj("type", "string"), "name", obj("type", "string")))),
-			"responses", obj("201", obj("description", "registered"))))
-	paths["/v1/lan/devices/{sn}"] = obj("delete", obj("tags", []any{"lan"}, "summary", "Forget a LAN printer", "parameters", []any{snParam}, "responses", obj("204", obj("description", "removed"))))
+	if !hosted {
+		// The LAN registry is global and unauthenticated: single-user servers only.
+		paths["/v1/lan/devices"] = obj(
+			"get", obj("tags", []any{"lan"}, "summary", "Registered LAN printers", "responses", jsonResp("list")),
+			"post", obj("tags", []any{"lan"}, "summary", "Register a LAN-mode printer (ip, serial, access code) and connect to it",
+				"requestBody", jsonBody(obj("type", "object", "required", []any{"ip", "serial", "accessCode"}, "properties", obj("ip", obj("type", "string"), "serial", obj("type", "string"), "accessCode", obj("type", "string"), "name", obj("type", "string")))),
+				"responses", obj("201", obj("description", "registered"))))
+		paths["/v1/lan/devices/{sn}"] = obj("delete", obj("tags", []any{"lan"}, "summary", "Forget a LAN printer", "parameters", []any{snParam}, "responses", obj("204", obj("description", "removed"))))
+	}
 
 	// Printer commands, one operation each.
 	for i := range mqtt.Specs {
@@ -247,7 +250,11 @@ func buildOpenAPI(region cloud.Region, publicURL string, hosted bool) map[string
 	for _, t := range tags {
 		tagObjs = append(tagObjs, obj("name", t))
 	}
-	desc := "Everything Bambu Handy " + cloud.AppVersionName + " can do, as HTTP. Printers are controlled over MQTT (cloud broker " + region.MQTTHost + " or LAN).\n\n" +
+	via := "cloud broker " + region.MQTTHost + " or LAN"
+	if hosted {
+		via = "cloud broker " + region.MQTTHost
+	}
+	desc := "Everything Bambu Handy " + cloud.AppVersionName + " can do, as HTTP. Printers are controlled over MQTT (" + via + ").\n\n" +
 		"**Authentication.** Every route takes `Authorization: Bearer <credential>`, where the credential is either the Bambu access token returned by `/v1/auth/login` (or `/v1/auth/tfa`) " +
 		"or an API key (`bk_…`) minted at [/login](/login) or `POST /v1/keys`. An API key acts as the Bambu account that created it, using the session stored at that account's latest login here. " +
 		"Key management and logout need the Bambu token.\n\n**MCP.** `/mcp` speaks the Model Context Protocol over streamable HTTP with the same API keys."
