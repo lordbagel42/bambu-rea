@@ -419,7 +419,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, sess *prin
 		writeErr(w, http.StatusForbidden, "API keys cannot sign the account out; use a Bambu login session")
 		return
 	}
-	if !s.requireLiveToken(w, r, sess) {
+	if !s.requireLiveToken(w, r, sess, false) {
 		return
 	}
 	// The stored session goes first, on a context the client cannot cancel

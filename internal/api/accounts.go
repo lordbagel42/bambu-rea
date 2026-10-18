@@ -74,14 +74,16 @@ func (s *Server) requireLoginSession(w http.ResponseWriter, r *http.Request, ses
 		writeErr(w, http.StatusForbidden, "this account has not logged in through this server; call /v1/auth/login here first")
 		return false
 	}
-	return s.requireLiveToken(w, r, sess)
+	return s.requireLiveToken(w, r, sess, true)
 }
 
 // requireLiveToken asks the cloud whether the caller's Bambu token is still
 // valid. Cached sessions are verified once, so the rare account-level actions
 // (key management, logout) check again: a token revoked elsewhere must not keep
-// managing the account here.
-func (s *Server) requireLiveToken(w http.ResponseWriter, r *http.Request, sess *principal) bool {
+// managing the account here. When the cloud cannot be reached, strict callers
+// fail; logout goes ahead, so an account's keys can be switched off while Bambu
+// is down.
+func (s *Server) requireLiveToken(w http.ResponseWriter, r *http.Request, sess *principal, strict bool) bool {
 	if s.store == nil {
 		return true
 	}
@@ -91,6 +93,10 @@ func (s *Server) requireLiveToken(w http.ResponseWriter, r *http.Request, sess *
 			s.dropSessions("", sess.token)
 			writeErr(w, http.StatusUnauthorized, "the Bambu cloud no longer accepts this access token; log in again")
 			return false
+		}
+		if !strict {
+			s.log.Printf("token check skipped: %v", err)
+			return true
 		}
 		writeCallErr(w, err)
 		return false
