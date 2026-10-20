@@ -193,6 +193,7 @@ func (s *Server) routes() {
 	m.Handle("/mcp", s.mcpHandler())
 
 	// Printers (cloud-bound or LAN-registered)
+	s.printerRoutes()
 	m.HandleFunc("GET /v1/devices", s.withSession(s.handleDevices))
 	m.HandleFunc("GET /v1/devices/{sn}/state", s.handleState)
 	m.HandleFunc("GET /v1/devices/{sn}/events", s.handleEvents)

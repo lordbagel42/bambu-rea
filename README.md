@@ -181,7 +181,77 @@ as the bearer token and every tool acts as that key's account:
                              "headers": { "Authorization": "Bearer bk_…" } } } }
 ```
 
-## Printer control
+## Resource-oriented printer API
+
+Start here when building an integration. A printer is the parent resource;
+lights, fans, temperatures, the current job, AMS, camera and maintenance live
+under it. You do not need MQTT command names for everyday controls.
+
+```sh
+export API=https://bambuapi.example.com  # your server running this version
+export TOKEN='your Bambu token or API key'
+curl -H "Authorization: Bearer $TOKEN" "$API/v1/printers"
+# {"printers":[{"serial":"01P...","name":"Workshop","model":"...","online":true,"status":"IDLE"}]}
+
+export SN='01P...'
+# Turn the chamber light on. Use {"on":false} to turn it off.
+curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -X PUT "$API/v1/printers/$SN/lights/chamber" -d '{"on":true}'
+```
+
+Use the same headers for these calls (paths below are relative to
+`/v1/printers/{sn}`):
+
+| Method | Path | Body / result |
+|---|---|---|
+| GET | `/` (no trailing slash) | Full merged printer state: `serial`, `updatedAt`, `print`, `modules`, `replies` |
+| GET | `/events` | Live SSE report stream |
+| GET | `/operations` | Every named operation, its method, path template and request schema |
+| PUT | `/lights/chamber` or `/lights/work` | `{"on":true}` |
+| PUT | `/fans/part`, `/fans/aux`, `/fans/chamber` | `{"percent":50}` (integer, 0–100) |
+| PUT | `/temperatures/bed` | `{"celsius":60}` (0 turns the heater off) |
+| PUT | `/temperatures/nozzle` | `{"celsius":215,"extruder":0}` (`extruder` defaults to 0) |
+| PUT | `/job/speed` | `{"mode":"silent"}` (`silent`, `standard`, `sport`, `ludicrous`) |
+| POST | `/job/pause`, `/job/resume`, `/job/stop` | No body needed |
+| POST | `/job/start` | `{"file":"/sdcard/model.gcode.3mf"}`; file must already exist on the printer |
+| POST | `/job/skip-objects` | `{"ids":[1,3]}` |
+| POST | `/motion/move` | `{"z":-1,"feed_rate":600}` (relative mm, positive mm/min) |
+| POST | `/motion/home` | `{}` homes all axes; `{"x":true}` homes X only |
+| POST | `/gcode` | `{"gcode":"G28"}` |
+| PUT | `/camera/capture`, `/camera/recording`, `/camera/timelapse`, `/buzzer` | `{"enabled":true}` |
+| POST | `/ams/load` | `{"ams_id":0,"slot_id":2}`; same tray addressing as the command catalog |
+| POST | `/ams/unload` | No body needed |
+
+There is a named endpoint for **each of the 90 catalogued printer commands**,
+including firmware upgrades, calibrations, nozzle management, AMS drying,
+camera settings, error handling and diagnostics. Browse the `printers/*` groups
+in `/docs`, or fetch `/operations` for machine-readable discovery. Advanced
+operations retain the catalog's Bambu parameter names and free-form bodies
+where the protocol is not fully typed. Discovery lists the API surface, **not**
+a claim that a particular printer supports every operation. Camera preparation
+and settings are included, but video streaming is still not implemented.
+
+Writes return the existing command receipt (`sequenceId`, `module`, `command`,
+`sent`, `secured`, and the printer's `reply`/`result` when acknowledged):
+
+- **200:** the printer acknowledged the command, not necessarily completed the action.
+- **202 with `?wait=0`:** published without waiting; this is not confirmation of success.
+- **400:** invalid JSON, missing/unknown fields or invalid values; nothing was sent.
+- **401:** missing or invalid credentials (registered LAN printers need no cloud token).
+- **422:** the printer rejected the command; the receipt includes its reason/error codes.
+- **502/504:** connection failure or reply timeout. A timeout does not mean the command
+  did not execute; do not blindly retry actions such as starting a print.
+
+Temperatures use the CLI's firmware-compatible M140/M104 path and leave
+model-specific thermal limits to firmware. Print-start safety options
+`bed_leveling`, `flow_cali`, `vibration_cali`, and `layer_inspect` default to true;
+send an explicit false to disable one. Unknown fields are rejected on typed
+operations rather than silently ignored. Free-form advanced operations remain
+passthroughs. Existing `/v1/devices`, cloud passthrough, CLI and MCP contracts
+are unchanged. `/v1/printers` lists cloud-bound printers; LAN-only printers are
+still registered/listed under `/v1/lan/devices` and can use the new control routes.
+
+## Low-level printer control
 
 Commands are named as in the app's catalog (`GET /v1/catalog/commands`): e.g.
 `Pause`, `Resume`, `Stop`, `SetFan`, `SetNozzleTemp`, `SetBedTemp`, `PrintSpeed`,
@@ -192,7 +262,7 @@ Commands are named as in the app's catalog (`GET /v1/catalog/commands`): e.g.
 B='-H Authorization:Bearer\ TOKEN'
 curl $B localhost:8080/v1/devices/SN/state                     # merged status (print.*), replies[module][command]
 curl $B localhost:8080/v1/devices/SN/events                    # SSE stream of every report
-curl $B -X POST localhost:8080/v1/devices/SN/commands/SetFan -d '{"fan_index":2,"speed":128}'
+curl $B -X POST localhost:8080/v1/devices/SN/commands/SetFan -d '{"fan_index":2,"speed":50}'
 curl $B -X POST localhost:8080/v1/devices/SN/commands/Pause?wait=0 -d '{}'   # 202, don't wait for the ack
 curl $B -X POST localhost:8080/v1/devices/SN/gcode -d '{"gcode":"M140 S60"}'
 curl $B -X POST localhost:8080/v1/devices/SN/move  -d '{"z":-1}'                # x/y/z mm, optional feed_rate

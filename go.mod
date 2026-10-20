@@ -4,6 +4,7 @@ go 1.24.4
 
 require (
 	github.com/eclipse/paho.mqtt.golang v1.5.1
+	github.com/google/jsonschema-go v0.4.2
 	github.com/modelcontextprotocol/go-sdk v1.4.0
 	golang.org/x/term v0.39.0
 	modernc.org/sqlite v1.46.0
@@ -11,7 +12,6 @@ require (
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

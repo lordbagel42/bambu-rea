@@ -45,6 +45,8 @@ func paramSchema(t string) map[string]any {
 		return obj("type", "array", "items", obj("type", "integer"))
 	case "object[]":
 		return obj("type", "array", "items", obj("type", "object"))
+	case "object":
+		return obj("type", "object")
 	}
 	return map[string]any{}
 }
@@ -165,34 +167,19 @@ func buildOpenAPI(region cloud.Region, publicURL string, hosted bool) map[string
 	// Printer commands, one operation each.
 	for i := range mqtt.Specs {
 		sp := &mqtt.Specs[i]
-		props := map[string]any{}
-		var required []any
-		for _, p := range sp.Params {
-			if p.Const != nil || p.Derived != "" {
-				continue
-			}
-			sc := paramSchema(p.Type)
-			if p.Wire != "" {
-				sc["description"] = "wire encoding: " + p.Wire
-			}
-			props[p.Key] = sc
-			if !p.Optional {
-				required = append(required, p.Key)
-			}
-		}
+		schema := commandBodySchema(sp)
+		props := schema["properties"].(map[string]any)
 		if sp.GcodeBuilder == "move_axis" {
 			props = obj("x", obj("type", "number"), "y", obj("type", "number"), "z", obj("type", "number"), "feed_rate", obj("type", "number"))
-			required = nil
-		}
-		schema := obj("type", "object", "properties", props, "additionalProperties", sp.RawParams)
-		if len(required) > 0 {
-			schema["required"] = required
+			schema["properties"] = props
+			delete(schema, "required")
 		}
 		summary := sp.Module + "/" + sp.Command
 		if sp.Doc != "" {
 			summary += " — " + sp.Doc
 		}
 		op := obj("tags", []any{"commands", "module:" + sp.Module}, "security", bearerSec, "summary", summary, "operationId", "cmd"+sp.Name,
+			"description", commandDescriptions[sp.Name]+"\n\nLow-level compatibility route using the catalog's Bambu parameter names. Prefer the resource-oriented printer API for ordinary application controls.",
 			"parameters", []any{snParam, waitParam}, "responses", jsonResp("commandResult"))
 		if len(props) > 0 || sp.RawParams {
 			op["requestBody"] = obj("content", obj("application/json", obj("schema", schema)))
@@ -228,9 +215,12 @@ func buildOpenAPI(region cloud.Region, publicURL string, hosted bool) map[string
 			}
 		}
 		op := obj("tags", []any{"cloud", "service:" + ep.Service}, "security", bearerSec, "operationId", ep.Name,
-			"summary", ep.Method+" "+ep.Path+" → "+ep.Response, "responses", jsonResp(ep.Response))
+			"summary", ep.Method+" "+ep.Path+" → "+ep.Response, "description", cloudEndpointDescription(ep), "responses", jsonResp(ep.Response))
 		if ep.Signed {
-			op["description"] = "Carries x-bbl-app-certification-id / x-bbl-device-security-sign (IoT app certificate). Supply -app-cert/-app-key or let the server fetch one."
+			op["description"] = op["description"].(string) + " The wrapper adds x-bbl-app-certification-id / x-bbl-device-security-sign automatically; supply -app-cert/-app-key or let the server fetch its app certificate."
+		}
+		if isLogoutPath(ep.Method, ep.Path) {
+			op["description"] = "Compatibility alias for POST /v1/auth/logout: signs the stored account out and invalidates its Bambu token. API keys cannot call this route; use a Bambu login token. This is not a raw passthrough around the wrapper's logout rules."
 		}
 		if len(params) > 0 {
 			op["parameters"] = params
@@ -241,24 +231,63 @@ func buildOpenAPI(region cloud.Region, publicURL string, hosted bool) map[string
 		entry[strings.ToLower(ep.Method)] = op
 	}
 
-	tags := []any{"meta", "auth", "account", "mcp", "printer", "security", "lan", "commands", "cloud"}
+	for path, entry := range paths {
+		for method, operation := range entry.(map[string]any) {
+			if description := routeDescriptions[strings.ToUpper(method)+" "+path]; description != "" {
+				operation.(map[string]any)["description"] = description
+			}
+		}
+	}
+	addPrinterOpenAPI(paths, bearerSec, snParam, waitParam)
+	tags := []any{"printers"}
+	printerTags := []any{"printers"}
+	groups := map[string]bool{}
+	for _, op := range printerOperations {
+		group := "printers/" + strings.Split(strings.TrimPrefix(op.Path, "/"), "/")[0]
+		if !groups[group] {
+			tags = append(tags, group)
+			printerTags = append(printerTags, group)
+			groups[group] = true
+		}
+	}
+	tags = append(tags, "meta", "auth", "account", "mcp", "printer", "security", "lan", "commands", "cloud")
+	advancedTags := []any{"printer", "commands", "cloud", "security", "meta"}
 	if hosted {
 		tags = slices.DeleteFunc(tags, func(t any) bool { return t == "lan" })
+	} else {
+		advancedTags = append(advancedTags, "lan")
 	}
 	mods := mqtt.Modules()
 	sort.Strings(mods)
 	for _, m := range mods {
 		tags = append(tags, "module:"+m)
 	}
+	displayNames := map[string]string{
+		"printers": "Overview", "auth": "Sign in", "account": "Account & API keys", "mcp": "MCP",
+		"printer": "Legacy printer API", "commands": "MQTT commands", "cloud": "Cloud passthrough",
+		"security": "Low-level security", "meta": "Catalogs & health", "lan": "LAN registry",
+	}
 	tagObjs := make([]any, 0, len(tags))
 	for _, t := range tags {
-		tagObjs = append(tagObjs, obj("name", t))
+		name := t.(string)
+		label := displayNames[name]
+		if strings.HasPrefix(name, "printers/") {
+			label = strings.ReplaceAll(strings.TrimPrefix(name, "printers/"), "-", " ")
+		}
+		tag := obj("name", name)
+		if label != "" {
+			tag["x-displayName"] = label
+		}
+		tagObjs = append(tagObjs, tag)
 	}
 	via := "cloud broker " + region.MQTTHost + " or LAN"
 	if hosted {
 		via = "cloud broker " + region.MQTTHost
 	}
-	desc := "Everything Bambu Handy " + cloud.AppVersionName + " can do, as HTTP. Printers are controlled over MQTT (" + via + ").\n\n" +
+	desc := "Start with `GET /v1/printers`, then control a printer through its resources: `PUT /v1/printers/{sn}/lights/chamber` with `{\"on\":true}`, " +
+		"`PUT /v1/printers/{sn}/fans/part` with `{\"percent\":50}`, or `POST /v1/printers/{sn}/job/pause`. " +
+		"`GET /v1/printers/{sn}/operations` lists every named operation and its request schema. Existing `/v1/devices` and `/v1/cloud` routes remain available for low-level access.\n\n" +
+		"Everything Bambu Handy " + cloud.AppVersionName + " can do, as HTTP. Printers are controlled over MQTT (" + via + ").\n\n" +
 		"**Authentication.** Every route takes `Authorization: Bearer <credential>`, where the credential is either the Bambu access token returned by `/v1/auth/login` (or `/v1/auth/tfa`) " +
 		"or an API key (`bk_…`) minted at [/login](/login) or `POST /v1/keys`. An API key acts as the Bambu account that created it, using the session stored at that account's latest login here. " +
 		"Key management and logout need the Bambu token.\n\n**MCP.** `/mcp` speaks the Model Context Protocol over streamable HTTP with the same API keys."
@@ -271,6 +300,13 @@ func buildOpenAPI(region cloud.Region, publicURL string, hosted bool) map[string
 		"info", obj("title", "bambu-api", "version", cloud.AppVersionName, "description", desc),
 		"servers", servers,
 		"tags", tagObjs,
+		// Module/service tags remain in the document for other consumers, but
+		// Scalar shows each low-level operation once under commands or cloud.
+		"x-tagGroups", []any{
+			obj("name", "Printer API", "tags", printerTags),
+			obj("name", "Account", "tags", []any{"auth", "account", "mcp"}),
+			obj("name", "Advanced", "tags", advancedTags),
+		},
 		"components", obj("securitySchemes", obj(
 			"bearer", obj("type", "http", "scheme", "bearer", "description", "Bambu cloud access token from /v1/auth/login, or an API key (bk_…)"),
 			"apiKeyHeader", obj("type", "apiKey", "in", "header", "name", "X-API-Key", "description", "API key (bk_…) as an alternative to the Authorization header"),
