@@ -16,11 +16,13 @@ hosted instance is at <https://bambuapi.raygen.dev> ([docs](https://bambuapi.ray
 | Path | What |
 |---|---|
 | `cmd/bambu-api` | the HTTP server |
+| `cmd/bambu-tunnel` | cgo helper that loads Bambu Studio's network plugin for camera streaming (one process per printer) |
 | `cmd/bambu` | the CLI (talks to the HTTP API, in-process by default) |
 | `internal/api` | routes, per-credential sessions, OpenAPI document, Scalar docs + login page, MCP server |
 | `internal/store` | SQLite persistence: accounts (Bambu session per uid) and API keys |
 | `pkg/bambu/cloud` | REST client: auth, regions, generated models + endpoint catalog, IoT app-cert signing |
 | `pkg/bambu/mqtt` | MQTT client (cloud + LAN), generated command catalog, G-code builders, secure channel signing, device state merge |
+| `pkg/bambu/liveview` | camera capabilities, live-view credentials (ttcode), `liveview/prepare`, `bambu:///` tunnel URLs; `tunnel/` runs `bambu-tunnel` |
 | `pkg/bambu/secure` | RSA / canonical-JSON helpers shared by both |
 | `catalog/*.json` | endpoints, models and MQTT commands extracted from the decompiled app |
 | `tools/` | extraction scripts and `gen_go.py`, which regenerates the `*_gen.go` files from `catalog/` |
@@ -78,7 +80,8 @@ names a dotenv file loaded first, for secrets a scheduler should not see. Secret
 are read from the environment after flag parsing, so `-h` never prints them.
 `GET /openapi.json` describes every route, including one operation per MQTT command
 and per cloud endpoint, and `GET /docs` renders it with Scalar. The `Dockerfile`
-builds a static binary on a distroless image that expects `/data` as a volume.
+builds the static server plus `bambu-tunnel` and the camera plugin on a slim
+Debian image that expects `/data` as a volume.
 
 ## Auth model
 
@@ -173,6 +176,7 @@ as the bearer token and every tool acts as that key's account:
 | `list_commands {module?}` | the command catalog with parameters |
 | `send_command {serial, name, params}` | any catalogued command, waits for the ack (destructive) |
 | `send_gcode {serial, gcode}` | raw G-code (destructive) |
+| `camera_snapshot {serial}` | a JPEG from the camera (MJPEG printers: P1, A1 series) |
 | `print_history {limit?}` | `user-service/my/tasks` |
 | `cloud_request {method, path, query?, body?}` | any cloud endpoint, signed when the catalog says so |
 
@@ -228,8 +232,7 @@ camera settings, error handling and diagnostics. Browse the `printers/*` groups
 in `/docs`, or fetch `/operations` for machine-readable discovery. Advanced
 operations retain the catalog's Bambu parameter names and free-form bodies
 where the protocol is not fully typed. Discovery lists the API surface, **not**
-a claim that a particular printer supports every operation. Camera preparation
-and settings are included, but video streaming is still not implemented.
+a claim that a particular printer supports every operation.
 
 Writes return the existing command receipt (`sequenceId`, `module`, `command`,
 `sent`, `secured`, and the printer's `reply`/`result` when acknowledged):
@@ -275,6 +278,40 @@ Parameter values are encoded the way the app encodes them (`enable_disable`,
 and feed rates); missing required parameters are rejected with 400 before anything
 is published. Replies are matched by `sequence_id` with the app's 10 s timeout; a
 printer `result != success` yields 422 with the full reply.
+
+### Camera
+
+Live view goes through the same relays the Handy app and Bambu Studio use.
+The cloud issues short-lived credentials (`iot-service/api/user/ttcode`), the
+printer picks the relay — TUTK on P1/A1 (and older X1 firmware), Agora on
+X1/H2 — and Bambu Studio's closed network plugin (`libBambuSource.so`, the
+only public implementation of either relay) decodes the transport. `bambu-api`
+runs that plugin inside `bambu-tunnel`, a separate process per printer, and
+fans the frames out to every viewer; the tunnel closes 5 s after the last
+viewer leaves. Without `bambu-tunnel` on `PATH` (or `-tunnel-bin`) and the
+plugin (`-tunnel-lib` / `BAMBU_SOURCE_LIB`), camera routes answer 501.
+
+| Method | Path | Returns |
+|---|---|---|
+| GET | `/v1/devices/{sn}/camera` | capabilities from the printer's report (`tutk`, `agora`, resolution), the relay a stream would use, and the active feed if any |
+| POST | `/v1/devices/{sn}/camera/ticket` | a 60 s ticket bound to this printer and your credential, with ready-made `stream`/`snapshot` paths carrying `?ticket=` |
+| GET | `/v1/devices/{sn}/camera/stream` | MJPEG printers: `multipart/x-mixed-replace` (an `<img src>` plays it); H.264 printers: a raw Annex B `video/h264` byte stream starting at a keyframe (feed it to jmuxer/MSE or ffplay). `X-Camera-Codec` and `X-Camera-Transport` say which. `?transport=tutk\|agora` overrides the relay when the feed is opened |
+| GET | `/v1/devices/{sn}/camera/snapshot.jpg` | one JPEG (MJPEG printers only; H.264 would need a decoder) |
+
+Because `<img>` and `<video>` cannot send headers, ask for a ticket first and
+put `?ticket=` on the stream or snapshot URL; the ticket opens only the camera
+routes of that one printer, so the account token stays out of URLs and proxy
+logs. Every viewer proves access through its own account (the printer's report
+must arrive on the caller's MQTT session) before it can join the shared feed,
+and hosted servers re-check the credential every 30 s while a stream is open.
+Registered LAN printers stream directly from the printer (`bambu:///local/…`
+port 6000 for P1/A1, RTSPS for X1), no cloud account needed.
+
+Verified on an A1 mini over TUTK: 1680×1080 MJPEG at the camera's ~0.5 fps,
+first frame about 2.7 s after the request (ttcode, `liveview/prepare`, IOTC
+connect). The Agora path (X1/H2) is implemented from the plugin's URL grammar
+recovered with Ghidra but has not been exercised against a printer; see
+`docs/liveview.md`.
 
 ### LAN mode
 
@@ -357,7 +394,9 @@ on any other endpoint.
   re-shapes such scalars instead of failing, but other mismatches may still
   surface as decode errors on endpoints that have not been exercised. Cloud request shapes come from the decompiled app and its
   decrypted string table, not from live traffic.
-- Camera/live-view (WebRTC/TUTK streams in the app) is not exposed.
+- Camera streaming depends on Bambu's closed network plugin; only the TUTK
+  relay has been exercised (A1 mini). Agora (X1/H2) is untested, and snapshots
+  of H.264 cameras are not available.
 
 ## Deploying
 
