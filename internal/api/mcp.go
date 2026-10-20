@@ -106,6 +106,10 @@ type gcodeArgs struct {
 	Gcode  string `json:"gcode" jsonschema:"G-code to run, one or more lines"`
 }
 
+type snapshotArgs struct {
+	Serial string `json:"serial" jsonschema:"printer serial number"`
+}
+
 type historyArgs struct {
 	Limit int `json:"limit,omitempty" jsonschema:"number of print tasks to return (default 20)"`
 }
@@ -233,6 +237,26 @@ func (s *Server) addMCPTools(server *mcp.Server) {
 				return nil, nil, fmt.Errorf("printer rejected the G-code: result=%s reason=%s errno=%d", res.Result, res.Reason, res.Errno)
 			}
 			return nil, res, nil
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "camera_snapshot", Description: "Current picture from the printer's camera (JPEG). Works for printers whose camera streams MJPEG (P1, A1 series); H.264 printers (X1, H2 series) need the /camera/stream endpoint instead.", Annotations: readOnly},
+		func(ctx context.Context, req *mcp.CallToolRequest, in snapshotArgs) (*mcp.CallToolResult, any, error) {
+			if strings.TrimSpace(in.Serial) == "" {
+				return nil, nil, errors.New("serial is required; call list_printers first")
+			}
+			sess, err := s.mcpSession(ctx, req)
+			if err != nil {
+				return nil, nil, err
+			}
+			c, err := sess.MQTT(ctx, s.cfg.Region)
+			if err != nil {
+				return nil, nil, err
+			}
+			jpeg, err := s.cameraSnapshot(ctx, &cameraTarget{serial: in.Serial, mqtt: c, sess: sess}, "")
+			if err != nil {
+				return nil, nil, err
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.ImageContent{MIMEType: "image/jpeg", Data: jpeg}}}, nil, nil
 		})
 
 	mcp.AddTool(server, &mcp.Tool{Name: "print_history", Description: "Recent print jobs of the account (user-service/my/tasks): model, printer, status, timings, cost.", Annotations: readOnly},

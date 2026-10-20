@@ -50,6 +50,9 @@ func main() {
 		dataKey    = flag.String("data-key", "", "64 hex chars (32 bytes) used to encrypt stored Bambu tokens; strongly recommended with -db (or BAMBU_DATA_KEY)")
 		publicURL  = flag.String("public-url", os.Getenv("BAMBU_PUBLIC_URL"), "externally visible base URL, e.g. https://bambuapi.example.com")
 		cors       = flag.String("cors-origins", os.Getenv("BAMBU_CORS_ORIGINS"), "comma-separated browser origins allowed to call the API (\"*\" for any)")
+		tunnelBin  = flag.String("tunnel-bin", os.Getenv("BAMBU_TUNNEL_BIN"), "bambu-tunnel executable for camera streaming (default: found on PATH)")
+		tunnelLib  = flag.String("tunnel-lib", os.Getenv("BAMBU_SOURCE_LIB"), "libBambuSource.so (Bambu Studio network plugin) loaded by bambu-tunnel")
+		tunnelLogs = flag.Bool("tunnel-logs", os.Getenv("BAMBU_TUNNEL_LOGS") == "1", "log the network plugin's own messages")
 	)
 	flag.Parse()
 	// Secrets are not flag defaults: -h and flag errors print defaults.
@@ -132,6 +135,9 @@ func main() {
 		Store:         st,
 		PublicURL:     strings.TrimRight(*publicURL, "/"),
 		CORSOrigins:   origins,
+		TunnelHelper:  *tunnelBin,
+		TunnelLib:     *tunnelLib,
+		TunnelLogs:    *tunnelLogs,
 	})
 	hs := &http.Server{
 		Addr:              *addr,
@@ -140,7 +146,9 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -152,6 +160,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	// ListenAndServe returns as soon as Shutdown starts; wait for the camera
+	// helpers and MQTT sessions to be closed before exiting.
+	stop()
+	<-shutdownDone
 }
 
 // loadEnvFile sets KEY=VALUE lines from a dotenv-style file into the process

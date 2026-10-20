@@ -141,6 +141,24 @@ func buildOpenAPI(region cloud.Region, publicURL string, hosted bool) map[string
 	paths["/v1/devices/{sn}/home"] = obj("post", obj("tags", []any{"printer"}, "security", bearerSec, "summary", "Home axes (all when body is empty)",
 		"parameters", []any{snParam, waitParam}, "requestBody", obj("content", obj("application/json", obj("schema", obj("type", "object", "properties", obj("x", obj("type", "boolean"), "y", obj("type", "boolean"), "z", obj("type", "boolean")))))), "responses", jsonResp("commandResult")))
 
+	transportParam := obj("name", "transport", "in", "query", "schema", obj("type", "string", "enum", []any{"tutk", "agora", "rtsps", "local"}),
+		"description", "relay to use; defaults to the printer's preferred one (cloud: agora when supported, else tutk; LAN: rtsps for X1-series serials, else MJPEG). Only applies when the feed is first opened.")
+	ticketParam := obj("name", "ticket", "in", "query", "schema", obj("type", "string"),
+		"description", "stream ticket from POST …/camera/ticket; stands in for the Authorization header for <img src> and <video src> tags that cannot set headers")
+	paths["/v1/devices/{sn}/camera"] = obj("get", obj("tags", []any{"printer"}, "security", bearerSec, "summary", "Camera capabilities and the relay this server would use",
+		"description", "Derived from the printer's last report (ipcam.liveview.remote, ipcam.tutk_server, home_flag) or the LAN registry. `supported` is false when the server has no liveview helper.",
+		"parameters", []any{snParam}, "responses", jsonResp("CameraInfo")))
+	paths["/v1/devices/{sn}/camera/ticket"] = obj("post", obj("tags", []any{"printer"}, "security", bearerSec, "summary", "Issue a 60 s stream ticket for this printer",
+		"description", "The ticket is bound to the printer and to the caller's credential and opens only the camera routes, so the account token never appears in a URL. Returns ready-made stream and snapshot paths.",
+		"parameters", []any{snParam}, "responses", jsonResp("CameraTicket")))
+	paths["/v1/devices/{sn}/camera/stream"] = obj("get", obj("tags", []any{"printer"}, "security", bearerSec, "summary", "Live camera stream",
+		"description", "multipart/x-mixed-replace JPEG for MJPEG cameras (P1/A1), which <img src> renders directly, or a raw H.264 Annex B byte stream (video/h264) for X1/H2 relays. The X-Camera-Codec header names the codec. One relay session per printer is shared between viewers and closed 5 s after the last one leaves.",
+		"parameters", []any{snParam, transportParam, ticketParam},
+		"responses", obj("200", obj("description", "multipart/x-mixed-replace or video/h264"), "501", obj("description", "no liveview helper configured"), "404", obj("description", "printer has no remote camera"))))
+	paths["/v1/devices/{sn}/camera/snapshot.jpg"] = obj("get", obj("tags", []any{"printer"}, "security", bearerSec, "summary", "One JPEG frame from the camera (MJPEG cameras only)",
+		"parameters", []any{snParam, transportParam, ticketParam},
+		"responses", obj("200", obj("description", "image/jpeg"), "400", obj("description", "the camera is H.264-only; use /camera/stream"), "501", obj("description", "no liveview helper configured"), "404", obj("description", "printer has no remote camera"))))
+
 	paths["/v1/devices/{sn}/security"] = obj(
 		"get", obj("tags", []any{"security"}, "security", bearerSec, "summary", "Secure-channel status for the printer (cert id, printer cert, field encryption)",
 			"parameters", []any{snParam}, "responses", jsonResp("SecureStatus")),

@@ -21,6 +21,7 @@ import (
 
 	"github.com/lordbagel42/bambu-rea/internal/store"
 	"github.com/lordbagel42/bambu-rea/pkg/bambu/cloud"
+	"github.com/lordbagel42/bambu-rea/pkg/bambu/liveview"
 	"github.com/lordbagel42/bambu-rea/pkg/bambu/mqtt"
 )
 
@@ -45,6 +46,15 @@ type Config struct {
 	PublicURL string
 	// CORSOrigins are browser origins allowed to call the API; "*" allows any.
 	CORSOrigins []string
+	// TunnelHelper is the bambu-tunnel executable for camera streaming; empty
+	// looks it up on PATH. TunnelLib is the libBambuSource.so it loads.
+	TunnelHelper string
+	TunnelLib    string
+	// TunnelLogs forwards the plugin's log lines to the server log.
+	TunnelLogs bool
+	// PluginVersion is the Bambu Studio network plugin version reported to
+	// printers in tunnel URLs (net_ver/cli_ver).
+	PluginVersion string
 }
 
 // Server is the HTTP handler.
@@ -65,6 +75,10 @@ type Server struct {
 	sessions map[string]*session
 	lan      map[string]*lanPrinter
 	done     chan struct{}
+
+	camMu   sync.Mutex
+	feeds   map[string]*cameraFeed
+	tickets map[string]cameraTicket
 }
 
 // New builds the server and starts its idle reaper.
@@ -81,6 +95,9 @@ func New(cfg Config) *Server {
 	if cfg.Logger == nil {
 		cfg.Logger = log.Default()
 	}
+	if cfg.PluginVersion == "" {
+		cfg.PluginVersion = liveview.PluginVersion
+	}
 	hc := &http.Client{Timeout: 60 * time.Second}
 	s := &Server{
 		cfg:        cfg,
@@ -92,6 +109,8 @@ func New(cfg Config) *Server {
 		sessions:   map[string]*session{},
 		lan:        map[string]*lanPrinter{},
 		done:       make(chan struct{}),
+		feeds:      map[string]*cameraFeed{},
+		tickets:    map[string]cameraTicket{},
 	}
 	if cfg.AppCert != nil {
 		s.appCert = cloud.NewAppCertSigner(nil, cfg.AppCert)
@@ -107,6 +126,7 @@ func New(cfg Config) *Server {
 // Close shuts down all MQTT sessions.
 func (s *Server) Close() {
 	close(s.done)
+	s.closeFeeds()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, sess := range s.sessions {
@@ -202,6 +222,10 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /v1/devices/{sn}/gcode", s.handleGcode)
 	m.HandleFunc("POST /v1/devices/{sn}/move", s.handleMove)
 	m.HandleFunc("POST /v1/devices/{sn}/home", s.handleHome)
+	m.HandleFunc("GET /v1/devices/{sn}/camera", s.handleCameraInfo)
+	m.HandleFunc("POST /v1/devices/{sn}/camera/ticket", s.handleCameraTicket)
+	m.HandleFunc("GET /v1/devices/{sn}/camera/stream", s.handleCameraStream)
+	m.HandleFunc("GET /v1/devices/{sn}/camera/snapshot.jpg", s.handleCameraSnapshot)
 	m.HandleFunc("GET /v1/devices/{sn}/security", s.handleSecurityStatus)
 	m.HandleFunc("POST /v1/devices/{sn}/security/exchange", s.handleSecurityExchange)
 	m.HandleFunc("DELETE /v1/devices/{sn}/security", s.handleSecurityDrop)
